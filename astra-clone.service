@@ -1,0 +1,36 @@
+[Unit]
+Description=Astra-compatible experimental control server
+After=network.target
+
+[Service]
+Type=simple
+User=astra-clone
+Group=astra-clone
+WorkingDirectory=/opt/astra-clone
+Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONDONTWRITEBYTECODE=1"
+Environment="ASTRA_PORT=8000"
+Environment="ASTRA_STATIC_DIR=/opt/astra-clone/www"
+Environment="ASTRA_STATE_FILE=/var/lib/astra-clone/state.json"
+Environment="ASTRA_CONFIG_FILE=/etc/astra-clone/astra-clone.conf"
+EnvironmentFile=/etc/astra-clone/astra-clone.conf
+ExecStart=/opt/astra-clone/venv/bin/python /opt/astra-clone/astra_clone_backend.py
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=astra-clone
+RuntimeDirectoryMode=0750
+StateDirectory=astra-clone
+StateDirectoryMode=0750
+UMask=0027
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/astra-clone /run/astra-clone
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

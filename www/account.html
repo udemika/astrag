@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Account · Media Server</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#111827;color:#e5e7eb}body{max-width:660px;margin:3rem auto;padding:0 1rem}section{background:#1f2937;padding:1.5rem;border-radius:12px;margin:1.5rem 0}label{display:block;margin:1rem 0 .4rem}input{box-sizing:border-box;width:100%;padding:.7rem;border:1px solid #64748b;border-radius:5px;background:#111827;color:inherit;font:inherit}button{padding:.7rem 1rem;margin-top:1.2rem;border:0;border-radius:5px;background:#60a5fa;color:#111827;font:inherit;cursor:pointer}button:disabled{opacity:.5}a{color:#93c5fd}p{line-height:1.6}.note{color:#cbd5e1;font-size:.9rem}#message{white-space:pre-wrap;min-height:1.6em}
+</style>
+</head>
+<body>
+<h1>Account access</h1>
+<p>Verify your login or change your own login and password. Use HTTPS when accessing this server over the Internet. No default account is created.</p>
+<section>
+<form id="account">
+<label for="login">Current login</label><input id="login" name="username" autocomplete="username" required maxlength="64">
+<label for="password">Current password</label><input id="password" name="password" type="password" autocomplete="current-password" required maxlength="256">
+<button id="verify" type="button">Verify login</button>
+<h2>Change credentials</h2>
+<label for="new-login">New login</label><input id="new-login" autocomplete="off" maxlength="64" pattern="[A-Za-z0-9_.@\-]{1,64}" required>
+<p class="note">1–64 letters (A–Z), digits, underscores, dots, @ or hyphens. Enter your current login to keep it.</p>
+<label for="new-password">New password</label><input id="new-password" type="password" autocomplete="new-password" minlength="12" maxlength="256" required>
+<label for="confirm">Confirm new password</label><input id="confirm" type="password" autocomplete="new-password" minlength="12" maxlength="256" required>
+<p class="note">12–256 characters, including letters and digits. Changing credentials disconnects existing account WebSockets; sign in again afterwards.</p>
+<button type="submit">Save new credentials</button>
+</form>
+<p id="message" role="status" aria-live="polite"></p>
+</section>
+<p><a href="/">Open original dashboard</a></p>
+<p class="note">This page does not save credentials in cookies, URLs or browser storage. The original dashboard has its own login and legacy credential-cookie behavior; verification here does not sign you into it. After a change, use your new credentials in that dashboard.</p>
+<script>
+'use strict';
+const form = document.getElementById('account');
+const field = id => document.getElementById(id);
+const message = text => { field('message').textContent = text; };
+async function send(path, body) {
+  const bytes = new TextEncoder().encode(field('login').value + ':' + field('password').value);
+  const basic = btoa(Array.from(bytes, byte => String.fromCharCode(byte)).join(''));
+  const response = await fetch(path, {method:'POST', credentials:'omit', cache:'no-store', redirect:'error', headers:{'Authorization':'Basic ' + basic,'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  const result = await response.json();
+  if (!response.ok) throw new Error(typeof result.detail === 'string' ? result.detail : 'Request failed (' + response.status + ')');
+  return result;
+}
+async function busy(action) {
+  form.querySelectorAll('button').forEach(button => button.disabled = true);
+  try { await action(); } catch (error) { message(error.message || 'Connection failed'); }
+  finally { form.querySelectorAll('button').forEach(button => button.disabled = false); }
+}
+field('verify').addEventListener('click', () => busy(async () => {
+  if (!field('login').reportValidity() || !field('password').reportValidity()) return;
+  const status = await send('/control/', {cmd:'status'});
+  message('Access verified (' + (status.observer ? 'observer' : 'administrator') + '). If authentication is disabled, status is public; enable authentication before Internet access.');
+}));
+form.addEventListener('submit', event => {
+  event.preventDefault();
+  busy(async () => {
+    if (field('new-password').value !== field('confirm').value) throw new Error('New passwords do not match.');
+    await send('/control/account/', {current_password:field('password').value, new_login:field('new-login').value, new_password:field('new-password').value});
+    form.reset();
+    message('Credentials changed. All fields cleared. Sign in with the new credentials.');
+  });
+});
+window.addEventListener('pagehide', () => form.reset());
+</script>
+</body>
+</html>

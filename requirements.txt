@@ -1,0 +1,8 @@
+# Runtime: Python 3.10+. Bounded compatibility ranges, not a lockfile.
+fastapi>=0.115.0,<0.120.0
+uvicorn[standard]>=0.30.0,<0.36.0
+pydantic>=2.9.0,<3.0.0
+python-multipart>=0.0.18,<0.1.0
+httpx>=0.27.0,<0.29.0
+# Optional for running the server; required only by extraction/tests.
+pyelftools>=0.31,<0.33

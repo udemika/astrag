@@ -1,0 +1,18 @@
+{
+  "config": {
+    "gid": 466560,
+    "make_stream": [],
+    "users": {},
+    "categories": [],
+    "servers": [],
+    "softcam": [],
+    "cas": [],
+    "dvb_tune": [],
+    "settings": {},
+    "hls": {},
+    "auth": {
+      "enable": false
+    },
+    "control_port": 3000
+  }
+}

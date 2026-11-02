@@ -1,0 +1,5 @@
+{
+  "name": "Astra Control Panel",
+  "description": "Async management API, web control panel, and native MPEG-TS/HLS stream engine.",
+  "requestFramePermissions": []
+}

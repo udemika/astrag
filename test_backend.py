@@ -156,12 +156,19 @@ class BackendTests(unittest.TestCase):
 
     def test_auth_roles_media_and_reset(self):
         self.stream()
+        self.assertIn("admin", self.cmd("load").json()["users"])
+        self.assertEqual(self.client.get("/playlist.m3u8").status_code, 200)
+        self.assertIn("/play/one", self.client.get("/playlist.m3u8").text)
+        self.assertEqual(self.client.get("/playlist.xspf").status_code, 200)
         self.enable_auth()
         self.assertEqual(self.cmd("status").status_code, 403)
         self.assertEqual(self.client.post("/control/", json={"cmd": "status"},
-                                         headers=self.basic("admin", "admin")).status_code, 403)
+                                         headers=self.basic("admin", "admin")).status_code, 200)
+        self.assertEqual(self.client.post("/control/", json={"cmd": "status"},
+                                         headers=self.basic("admin", "wrong")).status_code, 403)
         self.assertEqual(self.client.get("/play/one.m3u8").status_code, 403)
         self.assertEqual(self.client.get("/play/one/segment/segment_7.ts").status_code, 403)
+        self.assertEqual(self.client.get("/play/one.m3u8?token=admin").status_code, 200)
         response = self.client.post("/control/", json={"cmd": "status"}, headers=self.basic("watch"))
         self.assertTrue(response.json()["observer"])
         self.assertEqual(self.client.post("/control/", json={"cmd": "set-settings", "settings": {}},
@@ -172,6 +179,15 @@ class BackendTests(unittest.TestCase):
                                          json={"login": "root", "password": "NewStrongPassword456"},
                                          headers=self.basic()).status_code, 200)
         self.assertEqual(self.client.post("/control/", json={"cmd": "status"}, headers=self.basic()).status_code, 403)
+        # Verify Settings -> Users (set-user) login rename and password update
+        self.assertEqual(self.client.post("/control/", json={
+            "cmd": "set-user", "old_id": "admin", "id": "superadmin",
+            "user": {"type": 1, "enable": True, "password": "CustomAdminPass789"},
+        }, headers=self.basic("root", "NewStrongPassword456")).status_code, 200)
+        self.assertEqual(self.client.post("/control/", json={"cmd": "status"},
+                                         headers=self.basic("admin", "admin")).status_code, 403)
+        self.assertEqual(self.client.post("/control/", json={"cmd": "status"},
+                                         headers=self.basic("superadmin", "CustomAdminPass789")).status_code, 200)
 
     def test_websocket_top_level_envelope_and_redaction(self):
         with self.client.websocket_connect("/control/event/") as ws:

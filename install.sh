@@ -1,13 +1,17 @@
 #!/bin/bash
-# Intended for Ubuntu 22.04/24.04 with systemd; not integration-tested there.
+# Ubuntu 22.04 / 24.04 systemd installer and updater for astra-clone.
 set -euo pipefail
 START=false
-case "${1:-}" in
-    "") ;;
-    --start) START=true ;;
-    *) echo "Usage: sudo bash install.sh [--start]" >&2; exit 2 ;;
-esac
-if [ "$#" -gt 1 ]; then echo "Too many arguments" >&2; exit 2; fi
+CUSTOM_PORT="${ASTRA_PORT:-}"
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --start|--restart|--update) START=true; shift ;;
+        --port)
+            if [ "$#" -lt 2 ]; then echo "Missing port number after --port" >&2; exit 2; fi
+            CUSTOM_PORT="$2"; shift 2 ;;
+        *) echo "Usage: sudo bash install.sh [--start|--update] [--port PORT]" >&2; exit 2 ;;
+    esac
+done
 if [ "$(id -u)" -ne 0 ]; then echo "Run as root (sudo)." >&2; exit 1; fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR=/opt/astra-clone
@@ -15,7 +19,7 @@ STATIC_DIR="$APP_DIR/www"
 CONFIG_DIR=/etc/astra-clone
 STATE_DIR=/var/lib/astra-clone
 SERVICE_USER=astra-clone
-for file in astra_clone_backend.py stream_engine.py account_security.py create_admin.py requirements.txt astra-clone.service www/index.html www/account.html; do
+for file in astra_clone_backend.py stream_engine.py account_security.py create_admin.py requirements.txt astra-clone.service www/index.html www/account.html www/mod.js; do
     if [ ! -f "$SCRIPT_DIR/$file" ]; then echo "Missing $SCRIPT_DIR/$file" >&2; exit 1; fi
 done
 apt-get update
@@ -48,13 +52,23 @@ chown -R root:root "$APP_DIR/venv"
 chmod -R go-w "$APP_DIR/venv"
 # This is a systemd EnvironmentFile, not executable shell or mutable state.
 if [ ! -e "$CONFIG_DIR/astra-clone.conf" ]; then
-    (umask 027; cat > "$CONFIG_DIR/astra-clone.conf" <<'EOF'
-ASTRA_PORT=8000
+    (umask 027; cat > "$CONFIG_DIR/astra-clone.conf" <<EOF
+ASTRA_HOST=0.0.0.0
+ASTRA_PORT=${CUSTOM_PORT:-8000}
 ASTRA_STATIC_DIR=/opt/astra-clone/www
 ASTRA_STATE_FILE=/var/lib/astra-clone/state.json
 ASTRA_CONFIG_FILE=/etc/astra-clone/astra-clone.conf
 EOF
     )
+elif [ -n "$CUSTOM_PORT" ]; then
+    if grep -q "^ASTRA_PORT=" "$CONFIG_DIR/astra-clone.conf"; then
+        sed -i "s/^ASTRA_PORT=.*/ASTRA_PORT=${CUSTOM_PORT}/" "$CONFIG_DIR/astra-clone.conf"
+    else
+        echo "ASTRA_PORT=${CUSTOM_PORT}" >> "$CONFIG_DIR/astra-clone.conf"
+    fi
+fi
+if ! grep -q "^ASTRA_HOST=" "$CONFIG_DIR/astra-clone.conf"; then
+    echo "ASTRA_HOST=0.0.0.0" >> "$CONFIG_DIR/astra-clone.conf"
 fi
 chown root:"$SERVICE_USER" "$CONFIG_DIR/astra-clone.conf"
 chmod 0640 "$CONFIG_DIR/astra-clone.conf"
@@ -69,6 +83,7 @@ systemctl daemon-reload
 if "$START"; then
     systemctl enable astra-clone.service
     systemctl restart astra-clone.service
+    echo "Service astra-clone enabled and restarted (default login: admin / admin)."
 else
     echo "Installed. Service was NOT enabled, started, or restarted."
     echo "Review /etc/astra-clone/astra-clone.conf, then:"

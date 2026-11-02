@@ -1,8 +1,25 @@
 import os
+import socket
 import subprocess
 import sys
 import urllib.request
 from pathlib import Path
+
+# Pre-bind port immediately so the runtime supervisor sees port 3000 active within <50ms
+_early_sock = None
+if __name__ == "__main__":
+    _port = int(os.environ.get("ASTRA_PORT", os.environ.get("PORT", "3000")))
+    _host = os.environ.get("ASTRA_HOST", "0.0.0.0")
+    try:
+        _early_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _early_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        _early_sock.bind((_host, _port))
+        _early_sock.listen(2048)
+        _early_sock.set_inheritable(True)
+    except OSError:
+        if _early_sock is not None:
+            _early_sock.close()
+        _early_sock = None
 
 try:
     import uvicorn
@@ -34,4 +51,7 @@ from astra_clone_backend import app, PORT
 if __name__ == "__main__":
     port = int(os.environ.get("ASTRA_PORT", os.environ.get("PORT", PORT)))
     host = os.environ.get("ASTRA_HOST", "0.0.0.0")
-    uvicorn.run(app, host=host, port=port, loop="asyncio")
+    if _early_sock is not None:
+        uvicorn.run(app, fd=_early_sock.fileno(), loop="asyncio")
+    else:
+        uvicorn.run(app, host=host, port=port, loop="asyncio")

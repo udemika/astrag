@@ -290,6 +290,8 @@ class Engine:
             self._closed = False
             try:
                 for url in self.outputs:
+                    if urlsplit(url).scheme.lower() in ("http", "https"):
+                        continue
                     sock, address = await self._open_output(url)
                     queue = asyncio.Queue(maxsize=self.queue_size)
                     self._output_states.append((sock, address, queue))
@@ -626,9 +628,40 @@ class Engine:
 
     async def _http_input(self, url):
         import httpx
+        from urllib.parse import urljoin
+        clean_url = url.split("#", 1)[0]
         timeout = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
         async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
-            async with client.stream("GET", url) as response:
+            if clean_url.lower().split("?", 1)[0].endswith((".m3u8", ".m3u")):
+                seen_segments = OrderedDict()
+                playlist_url = clean_url
+                while self._running:
+                    resp = await client.get(playlist_url)
+                    resp.raise_for_status()
+                    text = resp.text
+                    lines = [line.strip() for line in text.splitlines() if line.strip()]
+                    if any(line.startswith("#EXT-X-STREAM-INF") for line in lines):
+                        for i, line in enumerate(lines):
+                            if line.startswith("#EXT-X-STREAM-INF") and i + 1 < len(lines):
+                                nxt = lines[i + 1]
+                                if not nxt.startswith("#"):
+                                    playlist_url = urljoin(str(resp.url), nxt)
+                                    break
+                        continue
+                    seg_urls = [urljoin(str(resp.url), line) for line in lines if not line.startswith("#")]
+                    new_segs = [u for u in seg_urls if u not in seen_segments]
+                    for seg_url in new_segs:
+                        if not self._running:
+                            return
+                        seen_segments[seg_url] = True
+                        while len(seen_segments) > 200:
+                            seen_segments.popitem(last=False)
+                        seg_resp = await client.get(seg_url)
+                        seg_resp.raise_for_status()
+                        self.feed(seg_resp.content)
+                    await asyncio.sleep(1.0 if new_segs else 1.5)
+                return
+            async with client.stream("GET", clean_url) as response:
                 response.raise_for_status()
                 async for chunk in response.aiter_bytes():
                     self.feed(chunk)

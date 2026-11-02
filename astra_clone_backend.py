@@ -4,10 +4,12 @@ HLS is an in-memory MPEG-TS remux, not a transcoder; codec/keyframe compatibilit
 is the caller's responsibility. DVB hardware and conditional access execution are
 not implemented (their configuration can be stored).
 """
+import argparse
 import asyncio
 import base64
 import copy
 import inspect
+import ipaddress
 import json
 import logging
 import os
@@ -19,8 +21,10 @@ import uuid
 from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
 from typing import List
+from xml.sax.saxutils import escape as xml_escape
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from account_security import FailedAuthLimiter, hash_password, valid_login, valid_password, verify_password
 from fastapi.staticfiles import StaticFiles
@@ -30,6 +34,10 @@ logger = logging.getLogger("astra.backend")
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = Path(os.environ.get("ASTRA_CONFIG_FILE", APP_DIR / "astra-clone.conf"))
 STATE_FILE = Path(os.environ.get("ASTRA_STATE_FILE", APP_DIR / "state.json"))
+
+FAVICON_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
 
 
 def read_options():
@@ -44,8 +52,9 @@ def read_options():
 
 
 OPTIONS = read_options()
-PORT = int(os.environ.get("ASTRA_PORT", os.environ.get("PORT", OPTIONS.get("PORT", "3000"))))
-STATIC_DIR = Path(os.environ.get("ASTRA_STATIC_DIR", OPTIONS.get("STATIC_DIR", str(APP_DIR / "www"))))
+HOST = os.environ.get("ASTRA_HOST", OPTIONS.get("ASTRA_HOST", OPTIONS.get("HOST", "0.0.0.0")))
+PORT = int(os.environ.get("ASTRA_PORT", os.environ.get("PORT", OPTIONS.get("ASTRA_PORT", OPTIONS.get("PORT", "3000")))))
+STATIC_DIR = Path(os.environ.get("ASTRA_STATIC_DIR", OPTIONS.get("ASTRA_STATIC_DIR", OPTIONS.get("STATIC_DIR", str(APP_DIR / "www")))))
 if not STATIC_DIR.is_dir() and "ASTRA_STATIC_DIR" not in os.environ:
     STATIC_DIR = APP_DIR / "www"
 
@@ -55,7 +64,8 @@ def validate_url(value, output=False):
         raise ValueError("URL must be a nonempty string without whitespace")
     # Astra options after # are passed unchanged to the native engine.
     parts = urlsplit(value)
-    if parts.scheme not in ({"udp"} if output else {"http", "https", "udp", "rtp"}):
+    allowed_schemes = {"udp", "http", "https"} if output else {"http", "https", "udp", "rtp"}
+    if parts.scheme not in allowed_schemes:
         raise ValueError("unsupported output transport" if output else "unsupported input transport")
     if not parts.hostname:
         raise ValueError("URL requires a host")
@@ -99,10 +109,33 @@ def make_engine(config):
     return Engine(config["input"], outputs=config.get("output", []))
 
 
+_DEFAULT_ADMIN_HASH = hash_password("admin")
+
+
+def default_admin():
+    return {
+        "type": 1,
+        "role": "admin",
+        "enable": True,
+        "password": _DEFAULT_ADMIN_HASH,
+        "created": int(time.time()),
+    }
+
+
 def defaults():
-    return {"gid": 466560, "make_stream": [], "users": {}, "categories": [],
-            "servers": [], "softcam": [], "cas": [], "dvb_tune": [],
-            "settings": {}, "hls": {}, "auth": {"enable": False}}
+    return {
+        "gid": 466560,
+        "make_stream": [],
+        "users": {"admin": default_admin()},
+        "categories": [],
+        "servers": [],
+        "softcam": [],
+        "cas": [],
+        "dvb_tune": [],
+        "settings": {},
+        "hls": {},
+        "auth": {"enable": False},
+    }
 
 
 def validate_config(config):
@@ -163,9 +196,12 @@ def disk_config():
             raise HTTPException(500, "Cannot read state file") from exc
         if not isinstance(data, dict) or not isinstance(data.get("config", data), dict):
             raise HTTPException(422, "State file must contain a configuration object")
-        config.update(data.get("config", data))
+        loaded = data.get("config", data)
+        config.update(loaded)
+        if not config.get("users"):
+            config["users"] = {"admin": default_admin()}
         # Legacy streams are migrated only if authoritative make_stream is absent.
-        if "make_stream" not in data.get("config", data) and isinstance(data.get("streams"), dict):
+        if "make_stream" not in loaded and isinstance(data.get("streams"), dict):
             config["make_stream"] = [dict(v, id=k) for k, v in data["streams"].items()]
     enabled = os.environ.get("ASTRA_AUTH_ENABLE")
     if enabled is not None:
@@ -201,6 +237,7 @@ class ServerState:
         self.commit = os.environ.get("ASTRA_COMMIT", "local")
         self.logs = []
         self.lock = asyncio.Lock()
+        self.extra_servers = {}
 
     @property
     def stream_configs(self):
@@ -236,6 +273,57 @@ class ServerState:
             raise
         return engines
 
+    def desired_extra_ports(self, config):
+        ports = set()
+        settings = config.get("settings", {})
+        for key in ("control_port", "http_play_port"):
+            val = settings.get(key)
+            if val not in (None, ""):
+                try:
+                    p = int(val)
+                    if 1 <= p <= 65535 and p != PORT:
+                        ports.add(p)
+                except (ValueError, TypeError):
+                    pass
+        for s in config.get("make_stream", []):
+            if not s.get("enable", True):
+                continue
+            for out_url in s.get("output", []):
+                parts = urlsplit(out_url.split("#", 1)[0])
+                if parts.scheme in ("http", "https") and parts.port:
+                    if 1 <= parts.port <= 65535 and parts.port != PORT:
+                        ports.add(parts.port)
+        return ports
+
+    async def sync_extra_ports(self, config):
+        if os.environ.get("ASTRA_DISABLE_EXTRA_PORTS") == "1":
+            return
+        wanted = self.desired_extra_ports(config)
+        for p in list(self.extra_servers):
+            if p not in wanted:
+                srv, task = self.extra_servers.pop(p)
+                srv.should_exit = True
+                await asyncio.gather(task, return_exceptions=True)
+        for p in sorted(wanted):
+            if p in self.extra_servers:
+                continue
+            try:
+                import uvicorn
+                uconfig = uvicorn.Config(app, host=HOST, port=p, log_level="warning", loop="asyncio")
+                srv = uvicorn.Server(uconfig)
+                srv.install_signal_handlers = lambda: None
+                task = asyncio.create_task(srv.serve())
+                self.extra_servers[p] = (srv, task)
+                logger.info("Started additional public HTTP/IPTV listener on %s:%d", HOST, p)
+            except Exception:
+                logger.warning("Could not start additional listener on port %d", p, exc_info=True)
+
+    async def stop_extra_ports(self):
+        for p, (srv, task) in list(self.extra_servers.items()):
+            srv.should_exit = True
+            await asyncio.gather(task, return_exceptions=True)
+        self.extra_servers.clear()
+
     async def apply(self, config, persist=True, rebuild=True):
         candidate = validate_config(config)
         old = self.config
@@ -255,16 +343,19 @@ class ServerState:
             logger.exception("Configuration transaction failed")
             raise HTTPException(500, "Configuration transaction failed; previous configuration retained") from exc
         self.config = candidate
+        await self.sync_extra_ports(candidate)
 
     async def broadcast(self, scope, payload):
         message = {"scope": scope, **redact(payload)}
         for ws, user in list(self.websocket_clients.items()):
-            if self.config.get("auth", {}).get("enable"):
-                current = self.config["users"].get(user["login"])
-                if not current or current.get("enable") is False:
-                    self.websocket_clients.pop(ws, None)
-                    await ws.close(code=1008)
-                    continue
+            if self.config.get("auth", {}).get("enable") or user.get("login"):
+                login = user.get("login")
+                if login:
+                    current = self.config["users"].get(login)
+                    if not current or current.get("enable") is False:
+                        self.websocket_clients.pop(ws, None)
+                        await ws.close(code=1008)
+                        continue
             try:
                 await ws.send_json(message)
             except Exception:
@@ -297,8 +388,9 @@ async def publish_stats():
 state = ServerState()
 
 
-def identity(credentials):
-    if not state.config.get("auth", {}).get("enable"):
+def identity(credentials, require_credentials=False):
+    auth_enabled = bool(state.config.get("auth", {}).get("enable"))
+    if not auth_enabled and not require_credentials and not credentials:
         return {"login": "", "admin": True}
     if not isinstance(credentials, str) or ":" not in credentials:
         raise HTTPException(403, "Forbidden")
@@ -308,28 +400,108 @@ def identity(credentials):
     good = verify_password(password, expected)
     if not good or user.get("enable") is False:
         raise HTTPException(403, "Forbidden")
+    exp = user.get("expire")
+    if isinstance(exp, (int, float)) and exp > 0 and time.time() > exp:
+        raise HTTPException(403, "Forbidden")
     return {"login": login, "admin": user.get("role") == "admin" or user.get("type") in (1, "1")}
 
 
-def require_auth(request):
-    credentials = None
+def extract_basic_credentials(request):
     header = request.headers.get("authorization", "")
     if header.lower().startswith("basic "):
         try:
-            credentials = base64.b64decode(header[6:], validate=True).decode("utf-8")
+            return base64.b64decode(header[6:], validate=True).decode("utf-8")
         except (ValueError, UnicodeError):
-            pass
-    return checked_identity(credentials, request.client.host if request.client else "unknown")
+            return None
+    return None
 
 
-def checked_identity(credentials, host):
-    if state.config.get("auth", {}).get("enable") and state.auth_limiter.blocked(host):
+def require_auth(request):
+    credentials = extract_basic_credentials(request)
+    ua = request.headers.get("user-agent", "").lower()
+    is_browser = "mozilla/" in ua or "sec-fetch-mode" in request.headers
+    ui_auth_required = request.headers.get("x-astra-ui-auth") == "required" or is_browser
+    if ui_auth_required and not credentials:
+        raise HTTPException(403, "Forbidden")
+    return checked_identity(
+        credentials,
+        request.client.host if request.client else "unknown",
+        require_credentials=ui_auth_required,
+    )
+
+
+def checked_identity(credentials, host, require_credentials=False):
+    auth_enabled = bool(state.config.get("auth", {}).get("enable"))
+    if (auth_enabled or credentials is not None) and state.auth_limiter.blocked(host):
         raise HTTPException(429, "Too many failed authentication attempts", headers={"Retry-After": "60"})
     try:
-        return identity(credentials)
+        return identity(credentials, require_credentials=require_credentials)
     except HTTPException:
-        state.auth_limiter.failed(host)
+        if auth_enabled or credentials is not None:
+            state.auth_limiter.failed(host)
         raise
+
+
+def _ip_matches(host, rules):
+    if not host or not isinstance(rules, list):
+        return False
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return host in rules
+    for rule in rules:
+        if not isinstance(rule, str) or not rule.strip():
+            continue
+        rule = rule.strip()
+        try:
+            if "/" in rule:
+                if addr in ipaddress.ip_network(rule, strict=False):
+                    return True
+            elif addr == ipaddress.ip_address(rule):
+                return True
+        except ValueError:
+            if host == rule:
+                return True
+    return False
+
+
+def require_media_auth(request):
+    auth_cfg = state.config.get("auth", {})
+    host = request.client.host if request.client else "unknown"
+    if auth_cfg.get("x_real_ip"):
+        forwarded = request.headers.get("x-real-ip") or request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        if forwarded:
+            host = forwarded
+    if _ip_matches(host, auth_cfg.get("http_ip_deny", [])):
+        raise HTTPException(403, "IP address denied")
+    token = request.query_params.get("token") or request.query_params.get("auth")
+    if token and token in (auth_cfg.get("http_token_deny") or []):
+        raise HTTPException(403, "Token denied")
+    if token:
+        if ":" in token:
+            try:
+                return checked_identity(token, host, require_credentials=True)
+            except HTTPException:
+                if auth_cfg.get("enable"):
+                    raise
+        for login, u in state.config.get("users", {}).items():
+            if u.get("enable") is False:
+                continue
+            if (u.get("token") and u.get("token") == token) or verify_password(token, u.get("password")):
+                return {"login": login, "admin": u.get("role") == "admin" or u.get("type") in (1, "1")}
+        if auth_cfg.get("enable"):
+            raise HTTPException(403, "Forbidden")
+    if not auth_cfg.get("enable"):
+        credentials = extract_basic_credentials(request)
+        if credentials:
+            try:
+                return identity(credentials, require_credentials=True)
+            except HTTPException:
+                pass
+        return {"login": "", "admin": False}
+    if _ip_matches(host, auth_cfg.get("http_ip_allow", [])):
+        return {"login": "", "admin": False}
+    return require_auth(request)
 
 
 def admin(user):
@@ -362,6 +534,7 @@ async def lifespan(app):
         await asyncio.gather(stats_task, return_exceptions=True)
         if installed:
             loop.remove_signal_handler(signal.SIGHUP)
+        await state.stop_extra_ports()
         await state.stop_engines()
         for ws in list(state.websocket_clients):
             await ws.close()
@@ -369,6 +542,12 @@ async def lifespan(app):
 
 
 app = FastAPI(title="Native Media Server", version="2.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 async def json_body(request):
@@ -422,6 +601,7 @@ async def control_api(request: Request):
         if not state.close_session(sid):
             raise HTTPException(404, "Session not found")
         return {"success": True}
+    sockets_to_close = []
     async with state.lock:
         if cmd == "restart":
             await state.apply(disk_config(), persist=False)
@@ -430,7 +610,17 @@ async def control_api(request: Request):
         event = {}
         result = {"success": True}
         if cmd == "upload":
-            config = object_payload(body, "config")
+            uploaded = object_payload(body, "config")
+            if isinstance(uploaded.get("users"), dict):
+                for ulogin, udata in uploaded["users"].items():
+                    if isinstance(udata, dict):
+                        pw = udata.get("password")
+                        if isinstance(pw, str) and pw and not pw.startswith("pbkdf2_sha256$"):
+                            udata["password"] = hash_password(pw)
+                        elif not pw and ulogin in config.get("users", {}):
+                            if "password" in config["users"][ulogin]:
+                                udata["password"] = config["users"][ulogin]["password"]
+            config = uploaded
             event = {"reload": True}
         elif cmd == "set-stream":
             data = object_payload(body, "stream")
@@ -463,26 +653,87 @@ async def control_api(request: Request):
         elif cmd == "set-user":
             data = object_payload(body, "user")
             sid = body.get("id")
-            if not isinstance(sid, str) or not sid:
+            if not isinstance(sid, str) or not sid.strip():
                 raise HTTPException(422, "id must be a nonempty login")
+            sid = sid.strip()
+            old_id = body.get("old_id")
+            if old_id is not None:
+                if not isinstance(old_id, str) or not old_id.strip():
+                    raise HTTPException(422, "old_id must be a nonempty login")
+                old_id = old_id.strip()
+            target_existing = old_id if (old_id and old_id in config["users"]) else sid
+            existing = copy.deepcopy(config["users"].get(target_existing, {}))
             if data.get("remove", body.get("remove", False)):
                 config["users"].pop(sid, None)
+                if old_id and old_id != sid:
+                    config["users"].pop(old_id, None)
+                    sockets_to_close.extend(revoke_account_sockets(old_id))
+                sockets_to_close.extend(revoke_account_sockets(sid))
                 data["remove"] = True
             else:
-                config["users"][sid] = data
+                if old_id and old_id != sid and sid in config["users"]:
+                    raise HTTPException(409, "Login is already in use")
+                if old_id and old_id != sid:
+                    config["users"].pop(old_id, None)
+                    sockets_to_close.extend(revoke_account_sockets(old_id))
+                merged = dict(existing)
+                merged.update(data)
+                raw_pw = data.get("password")
+                if isinstance(raw_pw, str) and raw_pw:
+                    if not raw_pw.startswith("pbkdf2_sha256$"):
+                        merged["password"] = hash_password(raw_pw)
+                    else:
+                        merged["password"] = raw_pw
+                    merged.pop("firstrun", None)
+                elif "password" in existing:
+                    merged["password"] = existing["password"]
+                else:
+                    merged["password"] = hash_password("admin")
+                try:
+                    utype = int(merged.get("type", 1 if merged.get("role") == "admin" else 3))
+                except (ValueError, TypeError):
+                    utype = 3
+                merged["type"] = utype
+                if utype == 1 or merged.get("role") == "admin":
+                    merged["role"] = "admin"
+                    merged["type"] = 1
+                elif "role" in merged and utype != 1:
+                    merged.pop("role", None)
+                if "enable" not in merged:
+                    merged["enable"] = True
+                else:
+                    merged["enable"] = bool(merged["enable"])
+                if not merged.get("created"):
+                    merged["created"] = int(time.time())
+                config["users"][sid] = merged
+                data = merged
             event = {"id": sid, "user": data}
+            if old_id and old_id != sid:
+                event["old_id"] = old_id
         elif cmd in ("set-settings", "set-auth"):
             key = cmd[4:]
-            data = object_payload(body, key)
+            if key not in body and key == "auth":
+                data = {"enable": False}
+            else:
+                data = object_payload(body, key)
             config[key] = {} if data.get("remove") else data
             event = {key: config[key]}
+        elif cmd == "set-log":
+            data = body.get("set")
+            if data is not None and not isinstance(data, dict):
+                raise HTTPException(422, "set must be an object")
+            config["log"] = copy.deepcopy(data) if data else {}
+            event = {"set": config["log"]}
         elif cmd == "set-config":
             key = body.get("key")
             if not isinstance(key, str) or not key:
                 raise HTTPException(422, "key required")
-            if "data" not in body:
-                raise HTTPException(422, "data required")
-            data = body["data"]
+            if "data" not in body and not body.get("remove"):
+                if key in ("hls", "settings", "auth"):
+                    body = dict(body, data={})
+                else:
+                    raise HTTPException(422, "data required")
+            data = body.get("data")
             if body.get("remove") or (isinstance(data, dict) and data.get("remove")):
                 config.pop(key, None)
                 data = None
@@ -532,8 +783,10 @@ async def control_api(request: Request):
             config["gid"] = body["gid"]
             event["gid"] = body["gid"]
         await state.apply(config, rebuild=bool(body.get("restart")))
-        await state.broadcast("stream_event" if cmd == "set-stream-input" else cmd, event)
-        return result
+        await state.broadcast("log_event" if cmd == "set-log" else ("stream_event" if cmd == "set-stream-input" else cmd), event)
+    if sockets_to_close:
+        await close_account_sockets(sockets_to_close)
+    return result
 
 
 def check_account_origin(request):
@@ -647,7 +900,7 @@ async def control_event_websocket(websocket: WebSocket):
 
 
 def media_engine(stream_id, request):
-    user = require_auth(request)
+    user = require_media_auth(request)
     if stream_id not in state.stream_configs:
         raise HTTPException(404, "Stream not found")
     engine = state.engines.get(stream_id)
@@ -657,12 +910,15 @@ def media_engine(stream_id, request):
 
 
 @app.get("/play/{stream_id}.m3u8")
+@app.get("/play/{stream_id}/index.m3u8")
 async def play_hls(stream_id: str, request: Request):
     engine, _ = media_engine(stream_id, request)
     if "udp" in request.query_params:
         raise HTTPException(501, "UDP playlist discovery is not supported")
+    token = request.query_params.get("token")
+    token_qs = f"?token={token}" if token else ""
     if "ts" in request.query_params:
-        return Response(f"#EXTM3U\n/play/{stream_id}\n", media_type="audio/x-mpegurl")
+        return Response(f"#EXTM3U\n/play/{stream_id}{token_qs}\n", media_type="audio/x-mpegurl")
     segmenter = getattr(engine, "hls", engine)
     method = (getattr(segmenter, "hls_playlist", None) or getattr(segmenter, "playlist", None)
               or getattr(segmenter, "get_playlist", None))
@@ -672,8 +928,10 @@ async def play_hls(stream_id: str, request: Request):
     if not playlist or "#EXTINF:" not in playlist:
         raise HTTPException(503, "HLS segments not yet available", headers={"Retry-After": "2"})
     # Segment URLs remain within the authenticated media route.
-    lines = [f"/play/{stream_id}/segment/{line}" if line and not line.startswith(("#", "/", "http")) else line
-             for line in playlist.splitlines()]
+    lines = [
+        f"/play/{stream_id}/segment/{line}{token_qs}" if line and not line.startswith(("#", "/", "http")) else line
+        for line in playlist.splitlines()
+    ]
     return Response("\n".join(lines) + "\n", media_type="application/vnd.apple.mpegurl",
                     headers={"Cache-Control": "no-store"})
 
@@ -699,16 +957,25 @@ async def play_segment(stream_id: str, segment_name: str, request: Request):
     return Response(data, media_type="video/mp2t")
 
 
+@app.get("/play/{stream_id}.ts")
 @app.get("/play/{stream_id}")
 async def play_stream(stream_id: str, request: Request):
     engine, user = media_engine(stream_id, request)
     queue = await maybe_await(engine.subscribe())
     sid = state.next_session
     state.next_session += 1
-    state.sessions[sid] = {"client_id": sid, "channel_id": stream_id,
-                           "channel_name": state.stream_configs[stream_id].get("name", ""),
-                           "addr": request.client.host if request.client else "", "login": user["login"],
-                           "started": time.time(), "queue": queue, "engine": engine}
+    state.sessions[sid] = {
+        "client_id": sid,
+        "channel_id": stream_id,
+        "channel_name": state.stream_configs[stream_id].get("name", ""),
+        "addr": request.client.host if request.client else "",
+        "login": user["login"],
+        "ua": request.headers.get("user-agent", ""),
+        "sdate": int(time.time() * 1000),
+        "started": time.time(),
+        "queue": queue,
+        "engine": engine,
+    }
 
     async def generate():
         try:
@@ -723,6 +990,106 @@ async def play_stream(stream_id: str, request: Request):
     return StreamingResponse(generate(), media_type="video/mp2t", headers={"Cache-Control": "no-store"})
 
 
+def _playlist_base_url(request: Request):
+    settings = state.config.get("settings", {})
+    proto = "http" if settings.get("http_play_disable_tls") else request.url.scheme
+    host_header = request.headers.get("host") or request.url.netloc or f"127.0.0.1:{PORT}"
+    hostname = host_header.split(":")[0]
+    custom_port = settings.get("http_play_port")
+    if custom_port:
+        return f"{proto}://{hostname}:{custom_port}"
+    return f"{proto}://{host_header}"
+
+
+def _build_m3u_playlist(request: Request):
+    require_media_auth(request)
+    if "udp" in request.query_params:
+        raise HTTPException(501, "UDP playlist discovery is not supported")
+    settings = state.config.get("settings", {})
+    header_extra = settings.get("http_play_m3u_header", "")
+    lines = [f"#EXTM3U {header_extra}".strip()]
+    base = _playlist_base_url(request)
+    use_hls = "hls" in request.query_params or (
+        "ts" not in request.query_params
+        and bool(settings.get("http_play_hls"))
+        and not settings.get("http_play_stream", True)
+    )
+    token = request.query_params.get("token")
+    token_qs = f"?token={token}" if token else ""
+    arrange = settings.get("playlist_arrange")
+    for s in state.config.get("make_stream", []):
+        if not s.get("enable", True):
+            continue
+        sid = s["id"]
+        name = s.get("name") or sid
+        attrs = [f'tvg-id="{s.get("xmltv_id", sid)}"']
+        groups = s.get("groups") or {}
+        if isinstance(groups, dict) and groups:
+            grp = groups.get(arrange) if arrange and arrange in groups else next(iter(groups.values()), "")
+            if grp:
+                attrs.append(f'group-title="{grp}"')
+        extinf = f"#EXTINF:-1 {' '.join(attrs)},{name}"
+        lines.append(extinf)
+        suffix = ".m3u8" if use_hls else ""
+        lines.append(f"{base}/play/{sid}{suffix}{token_qs}")
+    return Response("\n".join(lines) + "\n", media_type="audio/x-mpegurl", headers={"Cache-Control": "no-store"})
+
+
+def _build_xspf_playlist(request: Request):
+    require_media_auth(request)
+    settings = state.config.get("settings", {})
+    title = xml_escape(str(settings.get("http_play_xspf_title") or "Astra IPTV Playlist"))
+    base = _playlist_base_url(request)
+    token = request.query_params.get("token")
+    token_qs = f"?token={token}" if token else ""
+    tracks = []
+    for s in state.config.get("make_stream", []):
+        if not s.get("enable", True):
+            continue
+        sid = s["id"]
+        name = xml_escape(str(s.get("name") or sid))
+        loc = xml_escape(f"{base}/play/{sid}{token_qs}")
+        tracks.append(f"    <track><title>{name}</title><location>{loc}</location></track>")
+    body = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<playlist xmlns="http://xspf.org/ns/0/" version="1">\n'
+        f"  <title>{title}</title>\n"
+        "  <trackList>\n"
+        + ("\n".join(tracks) + "\n" if tracks else "")
+        + "  </trackList>\n"
+        "</playlist>\n"
+    )
+    return Response(body, media_type="application/xspf+xml", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/playlist.m3u8")
+@app.get("/playlist.m3u")
+async def default_m3u_playlist(request: Request):
+    return _build_m3u_playlist(request)
+
+
+@app.get("/playlist.xspf")
+async def default_xspf_playlist(request: Request):
+    return _build_xspf_playlist(request)
+
+
+@app.get("/mod.js")
+async def serve_mod_js():
+    mod_path = STATIC_DIR / "mod.js"
+    if mod_path.is_file():
+        return FileResponse(mod_path, media_type="application/javascript", headers={"Cache-Control": "no-store"})
+    return Response("/* mod.js */\n", media_type="application/javascript", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/favicon.png")
+@app.get("/favicon.ico")
+async def serve_favicon():
+    fav_path = STATIC_DIR / "favicon.png"
+    if fav_path.is_file():
+        return FileResponse(fav_path, media_type="image/png")
+    return Response(FAVICON_PNG, media_type="image/png")
+
+
 @app.get("/account/")
 async def account_page():
     return FileResponse(STATIC_DIR / "account.html", headers={
@@ -732,10 +1099,63 @@ async def account_page():
     })
 
 
+@app.get("/{custom_name}.m3u8")
+@app.get("/{custom_name}.m3u")
+async def custom_m3u_playlist(custom_name: str, request: Request):
+    configured = state.config.get("settings", {}).get("http_play_playlist_name") or "playlist"
+    if custom_name == configured:
+        return _build_m3u_playlist(request)
+    if custom_name in state.stream_configs:
+        return await play_hls(custom_name, request)
+    raise HTTPException(404, "Playlist or stream not found")
+
+
+@app.get("/{custom_name}.xspf")
+async def custom_xspf_playlist(custom_name: str, request: Request):
+    configured = state.config.get("settings", {}).get("http_play_playlist_name") or "playlist"
+    if custom_name == configured:
+        return _build_xspf_playlist(request)
+    raise HTTPException(404, "Playlist not found")
+
+
+def _find_http_output_stream(path: str):
+    norm = "/" + path.lstrip("/")
+    for s in state.config.get("make_stream", []):
+        if not s.get("enable", True):
+            continue
+        for out_url in s.get("output", []):
+            parts = urlsplit(out_url.split("#", 1)[0])
+            if parts.scheme in ("http", "https"):
+                out_path = parts.path or "/"
+                if out_path == norm or out_path.rstrip("/") == norm.rstrip("/"):
+                    return s["id"], out_path.endswith(".m3u8")
+    return None, False
+
+
+@app.get("/live/{stream_id}.m3u8")
+async def live_hls_alias(stream_id: str, request: Request):
+    return await play_hls(stream_id, request)
+
+
+@app.get("/live/{stream_id}")
+async def live_ts_alias(stream_id: str, request: Request):
+    sid, is_hls = _find_http_output_stream(f"/live/{stream_id}")
+    target = sid or stream_id
+    if is_hls or target.endswith(".m3u8"):
+        return await play_hls(target[:-5] if target.endswith(".m3u8") else target, request)
+    return await play_stream(target, request)
+
+
 if STATIC_DIR.is_dir():
     app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Astra-compatible media & control server")
+    parser.add_argument("-p", "--port", type=int, default=PORT, help="Primary HTTP/IPTV port (default: %(default)s)")
+    parser.add_argument("--host", default=HOST, help="Bind address (default: %(default)s)")
+    args, _ = parser.parse_known_args()
+    PORT = args.port
+    HOST = args.host
     import uvicorn
-    uvicorn.run(app, host=os.environ.get("ASTRA_HOST", "0.0.0.0"), port=PORT, loop="asyncio")
+    uvicorn.run(app, host=HOST, port=PORT, loop="asyncio")

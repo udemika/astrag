@@ -2,7 +2,15 @@
   "config": {
     "gid": 466560,
     "make_stream": [],
-    "users": {},
+    "users": {
+      "admin": {
+        "type": 1,
+        "role": "admin",
+        "enable": true,
+        "password": "pbkdf2_sha256$600000$023e70ff6c3e8932f615e303c17cde22$8a52e240e82e663f0420ee72ad7b6f87d3056c09be850e1c337aa80a4eb4012b",
+        "created": 1793641610
+      }
+    },
     "categories": [],
     "servers": [],
     "softcam": [],

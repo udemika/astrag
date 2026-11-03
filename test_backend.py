@@ -251,6 +251,13 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(scan_resp.json()["scan-init"], "ok")
         scan_id = scan_resp.json()["id"]
         self.assertEqual(self.cmd("scan-kill", id=scan_id).status_code, 200)
+        # Verify custom HTTP OUTPUT LIST URL (e.g. http://62.60.250.90:18000/1) routes TS, .ts, .m3u8, /index.m3u8, and segments
+        self.assertEqual(self.stream(sid="a001", output=["http://62.60.250.90:18000/1"]).status_code, 200)
+        self.assertEqual(self.client.head("/1").status_code, 200)
+        self.assertEqual(self.client.head("/1.ts").status_code, 200)
+        self.assertEqual(self.client.get("/1.m3u8").status_code, 200)
+        self.assertEqual(self.client.get("/1/index.m3u8").status_code, 200)
+        self.assertEqual(self.client.get("/1/segment/segment_7.ts").status_code, 200)
 
 
 if __name__ == "__main__":

@@ -323,7 +323,7 @@ class Segment:
 
 
 class Engine:
-    def __init__(self, urls=(), outputs=None, *, queue_size=1024,
+    def __init__(self, urls=(), outputs=None, *, queue_size=2048,
                  segment_duration=2.0, max_segments=5,
                  max_segment_bytes=2 * 1024 * 1024,
                  max_hls_bytes=6 * 1024 * 1024, retry_delay=0.5,
@@ -993,16 +993,18 @@ class Engine:
                          for pid, state in self._pids.items()}}
 
     async def _run_inputs(self):
+        prev_input_id = None
         while self._running:
             for idx, url in enumerate(self.urls, start=1):
                 if not self._running:
                     return
+                switched_input = prev_input_id is not None and prev_input_id != idx
+                prev_input_id = idx
                 self._active_input_id = idx
                 url_opts = parse_astra_url_options(url)
                 self._apply_filter_options(url_opts)
                 # A failed source cannot leave half a packet/section for its successor.
                 self._buffer.clear()
-                self._preroll.clear()
                 self._locked = False
                 for state in self._pids.values():
                     state["cc"] = None
@@ -1011,13 +1013,15 @@ class Engine:
                     assembler.reset()
                 if self._counts["packets"]:
                     self._break_timeline()
-                    self._pcr_pid = None
-                    self._tables.clear()
-                    self._pat_sections.clear()
-                    self._pat_identity = None
-                    self._pmt_pids.clear()
-                    self._elementary_pids.clear()
-                    self._psi = {0: _PSI(), 0x10: _PSI(), 0x11: _PSI()}
+                    if switched_input:
+                        self._preroll.clear()
+                        self._pcr_pid = None
+                        self._tables.clear()
+                        self._pat_sections.clear()
+                        self._pat_identity = None
+                        self._pmt_pids.clear()
+                        self._elementary_pids.clear()
+                        self._psi = {0: _PSI(), 0x10: _PSI(), 0x11: _PSI()}
                 try:
                     scheme = urlsplit(url).scheme.lower()
                     if scheme in ("http", "https"):
@@ -1035,43 +1039,159 @@ class Engine:
                 await asyncio.sleep(self.retry_delay)
 
     async def _stream_hls_playlist(self, client, playlist_url: str):
+        """Cesbo Astra sync_buffer HLS input: background segment prefetcher + smooth TS pacer."""
         seen_segments = OrderedDict()
-        first_load = True
-        while self._running:
-            resp = await client.get(playlist_url)
-            resp.raise_for_status()
-            text = resp.text
-            lines = [line.strip() for line in text.splitlines() if line.strip()]
-            if any(line.startswith("#EXT-X-STREAM-INF") for line in lines):
-                for i, line in enumerate(lines):
-                    if line.startswith("#EXT-X-STREAM-INF") and i + 1 < len(lines):
-                        nxt = lines[i + 1]
-                        if not nxt.startswith("#"):
-                            playlist_url = urljoin(str(resp.url), nxt)
-                            break
-                continue
-            seg_urls = [urljoin(str(resp.url), line) for line in lines if not line.startswith("#")]
-            if first_load and len(seg_urls) > 2:
-                # Start at live edge (last 2 segments) to avoid dumping old segments into RAM
-                for old_url in seg_urls[:-2]:
-                    seen_segments[old_url] = True
-            first_load = False
-            new_segs = [u for u in seg_urls if u not in seen_segments]
-            for seg_url in new_segs:
-                if not self._running:
-                    return
-                seen_segments[seg_url] = True
-                while len(seen_segments) > 120:
-                    seen_segments.popitem(last=False)
-                async with client.stream("GET", seg_url) as seg_resp:
-                    seg_resp.raise_for_status()
-                    async for chunk in seg_resp.aiter_bytes(chunk_size=188 * 64):
+        prefetch_queue: asyncio.Queue = asyncio.Queue(maxsize=4)
+        producer_error = None
+
+        async def _prefetch_producer():
+            nonlocal playlist_url, producer_error
+            first_load = True
+            consecutive_errors = 0
+            target_duration = 2.0
+            try:
+                while self._running:
+                    try:
+                        resp = await client.get(playlist_url)
+                        resp.raise_for_status()
+                        consecutive_errors = 0
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        consecutive_errors += 1
+                        self._counts["input_errors"] += 1
+                        self._last_error = f"{type(exc).__name__}: {exc}"
+                        if first_load or consecutive_errors >= 8:
+                            producer_error = exc
+                            return
+                        await asyncio.sleep(0.4)
+                        continue
+
+                    text = resp.text
+                    lines = [line.strip() for line in text.splitlines() if line.strip()]
+                    if any(line.startswith("#EXT-X-STREAM-INF") for line in lines):
+                        for i, line in enumerate(lines):
+                            if line.startswith("#EXT-X-STREAM-INF") and i + 1 < len(lines):
+                                nxt = lines[i + 1]
+                                if not nxt.startswith("#"):
+                                    playlist_url = urljoin(str(resp.url), nxt)
+                                    break
+                        continue
+
+                    seg_entries = []
+                    next_dur = None
+                    for line in lines:
+                        if line.startswith("#EXT-X-TARGETDURATION:"):
+                            try:
+                                target_duration = max(0.5, float(line.split(":", 1)[1].strip()))
+                            except ValueError:
+                                pass
+                        elif line.startswith("#EXTINF:"):
+                            raw_dur = line[8:].split(",", 1)[0].strip()
+                            try:
+                                next_dur = max(0.2, float(raw_dur))
+                            except ValueError:
+                                next_dur = target_duration
+                        elif not line.startswith("#"):
+                            seg_url = urljoin(str(resp.url), line)
+                            seg_entries.append((seg_url, next_dur if next_dur is not None else target_duration))
+                            next_dur = None
+
+                    if first_load and len(seg_entries) > 2:
+                        # Start 2 segments before live edge so sync_buffer immediately has lookahead
+                        for old_url, _ in seg_entries[:-2]:
+                            seen_segments[old_url] = True
+                    first_load = False
+
+                    new_entries = [(u, d) for (u, d) in seg_entries if u not in seen_segments]
+                    for seg_url, seg_dur in new_entries:
                         if not self._running:
                             return
-                        self.feed(chunk)
-                        # Yield to event loop so HTTP .ts / UDP subscribers drain without queue drops
+                        seen_segments[seg_url] = True
+                        while len(seen_segments) > 150:
+                            seen_segments.popitem(last=False)
+                        try:
+                            seg_resp = await client.get(seg_url)
+                            seg_resp.raise_for_status()
+                            seg_data = seg_resp.content
+                            if seg_data:
+                                await prefetch_queue.put((seg_dur, seg_data))
+                                consecutive_errors = 0
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            consecutive_errors += 1
+                            self._counts["input_errors"] += 1
+                            self._last_error = f"{type(exc).__name__}: {exc}"
+                            if consecutive_errors >= 8:
+                                producer_error = exc
+                                return
+                    poll_sleep = min(0.8, max(0.25, target_duration * 0.35)) if new_entries else 0.35
+                    await asyncio.sleep(poll_sleep)
+            finally:
+                await prefetch_queue.put(None)
+
+        producer_task = asyncio.create_task(_prefetch_producer())
+        first_segment = True
+        chunk_bytes = 188 * 32  # 6,016 bytes (32 TS packets per paced slice)
+        try:
+            while self._running:
+                item = await prefetch_queue.get()
+                if item is None:
+                    break
+                seg_dur, seg_data = item
+                total_len = len(seg_data)
+                if total_len <= chunk_bytes:
+                    self.feed(seg_data)
+                    await asyncio.sleep(0)
+                    first_segment = False
+                    continue
+
+                pos = 0
+                if first_segment:
+                    # Immediate bootstrap burst (~48 KB) so PAT/PMT and initial video lock instantly
+                    burst_len = min(total_len, 188 * 256)
+                    self.feed(seg_data[:burst_len])
+                    pos = burst_len
+                    first_segment = False
+                    await asyncio.sleep(0)
+                    if pos >= total_len:
+                        continue
+
+                remaining_bytes = total_len - pos
+                num_steps = max(1, (remaining_bytes + chunk_bytes - 1) // chunk_bytes)
+                # Adaptive sync_buffer PLL pacing based on lookahead queue depth
+                qdepth = prefetch_queue.qsize()
+                if qdepth >= 2:
+                    pace_factor = 0.76
+                elif qdepth == 1:
+                    pace_factor = 0.90
+                else:
+                    pace_factor = 0.98
+                effective_dur = seg_dur * (remaining_bytes / total_len) * pace_factor
+                step_sleep = min(0.05, max(0.0, effective_dur / num_steps))
+
+                while pos < total_len and self._running:
+                    t0 = time.monotonic()
+                    end = min(total_len, pos + chunk_bytes)
+                    self.feed(seg_data[pos:end])
+                    pos = end
+                    # Re-check queue depth dynamically: if 2+ segments buffered, speed up slightly
+                    if prefetch_queue.qsize() >= 2 and step_sleep > 0.005:
+                        target_wait = step_sleep * 0.75
+                    else:
+                        target_wait = step_sleep
+                    elapsed = time.monotonic() - t0
+                    wait = target_wait - elapsed
+                    if wait > 0.001:
+                        await asyncio.sleep(wait)
+                    else:
                         await asyncio.sleep(0)
-            await asyncio.sleep(0.6 if new_segs else 1.0)
+            if producer_error is not None:
+                raise producer_error
+        finally:
+            producer_task.cancel()
+            await asyncio.gather(producer_task, return_exceptions=True)
 
     async def _http_input(self, url, url_opts=None):
         import httpx
@@ -1079,9 +1199,9 @@ class Engine:
         clean_url = url.split("#", 1)[0]
         conn_timeout = float(url_opts.get("timeout", 10.0)) if str(url_opts.get("timeout", "")).replace(".", "").isdigit() else 10.0
         ua = url_opts.get("ua") or "AstraG/2.0"
-        timeout = httpx.Timeout(connect=conn_timeout, read=25.0, write=10.0, pool=10.0)
-        limits = httpx.Limits(max_keepalive_connections=4, max_connections=8)
-        headers = {"User-Agent": ua, "Accept": "*/*", "Icy-MetaData": "0"}
+        timeout = httpx.Timeout(connect=conn_timeout, read=30.0, write=10.0, pool=10.0)
+        limits = httpx.Limits(max_keepalive_connections=6, max_connections=12)
+        headers = {"User-Agent": ua, "Accept": "*/*", "Icy-MetaData": "0", "Connection": "keep-alive"}
         async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, limits=limits, headers=headers) as client:
             if clean_url.lower().split("?", 1)[0].endswith((".m3u8", ".m3u")):
                 await self._stream_hls_playlist(client, clean_url)
@@ -1094,7 +1214,7 @@ class Engine:
                     switch_to_hls = True
                 else:
                     first_chunk = True
-                    async for chunk in response.aiter_bytes(chunk_size=188 * 64):
+                    async for chunk in response.aiter_bytes(chunk_size=188 * 32):
                         if not self._running:
                             return
                         if first_chunk:

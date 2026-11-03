@@ -25,7 +25,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from account_security import FailedAuthLimiter, hash_password, valid_login, valid_password, verify_password
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -79,10 +79,17 @@ if not STATIC_DIR.is_dir() and "ASTRA_STATIC_DIR" not in os.environ:
 
 
 def validate_url(value, output=False):
-    if not isinstance(value, str) or not value or any(c.isspace() for c in value):
+    if not isinstance(value, str):
         raise ValueError("URL must be a nonempty string without whitespace")
+    value = value.strip()
+    if not value or any(c.isspace() for c in value):
+        raise ValueError("URL must be a nonempty string without whitespace")
+    if output and value.startswith(("http://:", "https://:")):
+        scheme, rest = value.split("://:", 1)
+        value = f"{scheme}://0.0.0.0:{rest}"
     # Astra options after # are passed unchanged to the native engine.
-    parts = urlsplit(value)
+    clean = value.split("#", 1)[0]
+    parts = urlsplit(clean)
     allowed_schemes = {"udp", "http", "https"} if output else {"http", "https", "udp", "rtp"}
     if parts.scheme not in allowed_schemes:
         raise ValueError("unsupported output transport" if output else "unsupported input transport")
@@ -108,12 +115,12 @@ class StreamConfig(BaseModel):
     @field_validator("input")
     @classmethod
     def inputs(cls, values):
-        return [validate_url(v) for v in values]
+        return [validate_url(v) for v in values if not (isinstance(v, str) and not v.strip())]
 
     @field_validator("output")
     @classmethod
     def outputs(cls, values):
-        return [validate_url(v, True) for v in values]
+        return [validate_url(v, True) for v in values if not (isinstance(v, str) and not v.strip())]
 
 
 async def maybe_await(value):
@@ -348,13 +355,24 @@ class ServerState:
             if p not in wanted:
                 srv, task = self.extra_servers.pop(p)
                 srv.should_exit = True
-                await asyncio.gather(task, return_exceptions=True)
+                try:
+                    await asyncio.wait_for(task, timeout=1.0)
+                except (asyncio.TimeoutError, Exception):
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
         for p in sorted(wanted):
             if p in self.extra_servers:
                 continue
             try:
                 import uvicorn
-                uconfig = uvicorn.Config(app, host=HOST, port=p, log_level="warning", loop="asyncio")
+                uconfig = uvicorn.Config(
+                    app,
+                    host=HOST,
+                    port=p,
+                    log_level="warning",
+                    loop="asyncio",
+                    lifespan="off",
+                )
                 srv = uvicorn.Server(uconfig)
                 srv.install_signal_handlers = lambda: None
                 task = asyncio.create_task(srv.serve())
@@ -366,8 +384,42 @@ class ServerState:
     async def stop_extra_ports(self):
         for p, (srv, task) in list(self.extra_servers.items()):
             srv.should_exit = True
-            await asyncio.gather(task, return_exceptions=True)
+            try:
+                await asyncio.wait_for(task, timeout=1.0)
+            except (asyncio.TimeoutError, Exception):
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
         self.extra_servers.clear()
+
+    async def _sync_engines_incremental(self, old_config, new_config):
+        old_map = {s["id"]: s for s in old_config.get("make_stream", [])}
+        new_map = {s["id"]: s for s in new_config.get("make_stream", [])}
+        to_stop = [
+            sid for sid in list(self.engines)
+            if sid not in new_map or new_map[sid] != old_map.get(sid)
+        ]
+        for sess_id, sess in list(self.sessions.items()):
+            if sess.get("channel_id") in to_stop:
+                self.close_session(sess_id)
+        stopped_engines = [self.engines.pop(sid) for sid in to_stop if sid in self.engines]
+        if stopped_engines:
+            results = await asyncio.gather(*(maybe_await(e.stop()) for e in stopped_engines), return_exceptions=True)
+            if any(isinstance(r, BaseException) for r in results):
+                raise RuntimeError("an engine failed to stop")
+        started_sids = []
+        try:
+            for sid, s in new_map.items():
+                if sid in self.engines:
+                    continue
+                if s.get("enable", True) and s.get("active", True) and s["input"]:
+                    engine = make_engine(s)
+                    self.engines[sid] = engine
+                    started_sids.append(sid)
+                    await maybe_await(engine.start())
+        except BaseException:
+            failed = [self.engines.pop(sid) for sid in started_sids if sid in self.engines]
+            await asyncio.gather(*(maybe_await(e.stop()) for e in failed), return_exceptions=True)
+            raise
 
     async def apply(self, config, persist=True, rebuild=True):
         candidate = validate_config(config)
@@ -375,8 +427,11 @@ class ServerState:
         changed = candidate["make_stream"] != old["make_stream"] or rebuild
         try:
             if changed:
-                await self.stop_engines()
-                self.engines = await self.build(candidate)
+                if rebuild or not self.engines:
+                    await self.stop_engines()
+                    self.engines = await self.build(candidate)
+                else:
+                    await self._sync_engines_incremental(old, candidate)
             if persist:
                 atomic_save(candidate)
         except Exception as exc:
@@ -1091,7 +1146,7 @@ async def play_stream(stream_id: str, request: Request):
     sub_fn = engine.subscribe
     try:
         sig = inspect.signature(sub_fn)
-        queue = await maybe_await(sub_fn(4096) if len(sig.parameters) >= 1 else sub_fn())
+        queue = await maybe_await(sub_fn(8192) if len(sig.parameters) >= 1 else sub_fn())
     except (ValueError, TypeError):
         queue = await maybe_await(sub_fn())
     sid = state.next_session
@@ -1111,13 +1166,16 @@ async def play_stream(stream_id: str, request: Request):
 
     async def generate():
         try:
-            # Send immediate PAT + PMT + pre-roll burst so VLC locks onto video/audio immediately
+            # Send immediate PAT + PMT + pre-roll burst once on connect so VLC locks immediately.
+            # Never re-inject cached PAT/PMT packets mid-stream when the stream has native PSI
+            # tables, because cached packets have static Continuity Counters (CC) that would
+            # trigger demuxer discontinuities and periodic playback freezes.
             burst_fn = getattr(engine, "bootstrap_burst", None)
             if callable(burst_fn):
                 burst = burst_fn()
                 if burst:
                     yield burst
-            prefix_fn = getattr(engine, "_prefix", None)
+            synth_fn = getattr(engine, "_synth_psi_prefix", None)
             batches_since_psi = 0
             while True:
                 first = await queue.get()
@@ -1134,9 +1192,9 @@ async def play_stream(stream_id: str, request: Request):
                             break
                         buf.extend(nxt)
                     batches_since_psi += 1
-                    if batches_since_psi >= 250 and callable(prefix_fn):
+                    if batches_since_psi >= 250 and callable(synth_fn) and not getattr(engine, "_tables", None):
                         batches_since_psi = 0
-                        psi = prefix_fn()
+                        psi = synth_fn()
                         if psi:
                             yield psi + bytes(buf)
                         else:
@@ -1147,9 +1205,9 @@ async def play_stream(stream_id: str, request: Request):
                         break
                 else:
                     batches_since_psi += 1
-                    if batches_since_psi >= 500 and callable(prefix_fn):
+                    if batches_since_psi >= 500 and callable(synth_fn) and not getattr(engine, "_tables", None):
                         batches_since_psi = 0
-                        psi = prefix_fn()
+                        psi = synth_fn()
                         if psi:
                             yield psi + first
                         else:
@@ -1283,12 +1341,106 @@ async def account_page():
     })
 
 
+_RESERVED_UI_PREFIXES = ("/control", "/api", "/account", "/__health", "/mod.js", "/favicon.", "/index.html")
+
+
+def _extract_request_port(request: Request):
+    if request.url.port:
+        return request.url.port
+    host_hdr = request.headers.get("host", "")
+    if ":" in host_hdr:
+        try:
+            return int(host_hdr.rsplit(":", 1)[1])
+        except ValueError:
+            pass
+    return None
+
+
+def _resolve_http_output(path: str, req_port: int = None):
+    """Match an incoming HTTP path against any stream's configured OUTPUT LIST URLs.
+
+    Supports:
+      - http://host:port/1          -> GET /1, /1.ts, /1.m3u8, /1/index.m3u8, /1/segment/...
+      - http://host:port/1.ts       -> GET /1.ts, /1, /1.m3u8, /1/index.m3u8
+      - http://host:port/1/index.m3u8 -> GET /1/index.m3u8, /1.m3u8, /1, /1.ts, /1/segment-...
+    Returns (stream_id, mode, segment_name) where mode is 'ts', 'hls', or 'segment',
+    or (None, None, None) if no stream output matches.
+    """
+    req_path = "/" + (path or "").lstrip("/")
+    if req_path != "/":
+        req_path = req_path.rstrip("/")
+    if req_path == "/" or any(req_path == p or req_path.startswith(p + "/") for p in _RESERVED_UI_PREFIXES):
+        return None, None, None
+
+    fallback_match = (None, None, None)
+    for s in state.config.get("make_stream", []):
+        if not s.get("enable", True):
+            continue
+        sid = s["id"]
+        for out_url in s.get("output", []):
+            clean = out_url.split("#", 1)[0].strip()
+            parts = urlsplit(clean)
+            if parts.scheme.lower() not in ("http", "https"):
+                continue
+            out_port = parts.port
+            out_path = "/" + (parts.path or "").lstrip("/")
+            if out_path != "/":
+                out_path = out_path.rstrip("/")
+            if out_path == "/":
+                continue
+
+            if out_path.endswith("/index.m3u8"):
+                base_path = out_path[:-11] or "/"
+                configured_hls = True
+            elif out_path.endswith(".m3u8"):
+                base_path = out_path[:-5] or "/"
+                configured_hls = True
+            elif out_path.endswith(".ts"):
+                base_path = out_path[:-3] or "/"
+                configured_hls = False
+            else:
+                base_path = out_path
+                configured_hls = False
+
+            matched = None
+            if req_path == out_path:
+                matched = (sid, "hls" if configured_hls else "ts", None)
+            elif base_path != "/" and req_path in (base_path, f"{base_path}.ts"):
+                matched = (sid, "ts", None)
+            elif base_path != "/" and req_path in (f"{base_path}.m3u8", f"{base_path}/index.m3u8"):
+                matched = (sid, "hls", None)
+            elif base_path != "/" and req_path.startswith(f"{base_path}/segment/"):
+                seg = req_path[len(base_path) + 9:]
+                if seg:
+                    matched = (sid, "segment", seg)
+            elif base_path != "/" and req_path.startswith(f"{base_path}/") and req_path.endswith(".ts"):
+                seg = req_path.rsplit("/", 1)[-1]
+                if seg.startswith("segment-"):
+                    matched = (sid, "segment", seg)
+
+            if matched is not None:
+                if req_port is not None and out_port == req_port:
+                    return matched
+                if fallback_match[0] is None:
+                    fallback_match = matched
+
+    return fallback_match
+
+
+def _find_http_output_stream(path: str, req_port: int = None):
+    sid, mode, _ = _resolve_http_output(path, req_port)
+    return sid, (mode == "hls")
+
+
 @app.api_route("/{custom_name}.m3u8", methods=["GET", "HEAD"])
 @app.api_route("/{custom_name}.m3u", methods=["GET", "HEAD"])
 async def custom_m3u_playlist(custom_name: str, request: Request):
     configured = state.config.get("settings", {}).get("http_play_playlist_name") or "playlist"
     if custom_name == configured:
         return _build_m3u_playlist(request)
+    sid, _, _ = _resolve_http_output(request.url.path, _extract_request_port(request))
+    if sid is not None:
+        return await play_hls(sid, request)
     if custom_name in state.stream_configs:
         return await play_hls(custom_name, request)
     raise HTTPException(404, "Playlist or stream not found")
@@ -1302,33 +1454,21 @@ async def custom_xspf_playlist(custom_name: str, request: Request):
     raise HTTPException(404, "Playlist not found")
 
 
-def _find_http_output_stream(path: str):
-    norm = "/" + path.lstrip("/")
-    for s in state.config.get("make_stream", []):
-        if not s.get("enable", True):
-            continue
-        for out_url in s.get("output", []):
-            parts = urlsplit(out_url.split("#", 1)[0])
-            if parts.scheme in ("http", "https"):
-                out_path = parts.path or "/"
-                if out_path == norm or out_path.rstrip("/") == norm.rstrip("/"):
-                    return s["id"], out_path.endswith(".m3u8")
-    return None, False
-
-
 @app.api_route("/live/{stream_id}.m3u8", methods=["GET", "HEAD"])
 async def live_hls_alias(stream_id: str, request: Request):
-    return await play_hls(stream_id, request)
+    sid, _, _ = _resolve_http_output(request.url.path, _extract_request_port(request))
+    return await play_hls(sid or stream_id, request)
 
 
 @app.api_route("/live/{stream_id}.ts", methods=["GET", "HEAD"])
 async def live_ts_ext_alias(stream_id: str, request: Request):
-    return await play_stream(stream_id, request)
+    sid, _, _ = _resolve_http_output(request.url.path, _extract_request_port(request))
+    return await play_stream(sid or stream_id, request)
 
 
 @app.api_route("/live/{stream_id}", methods=["GET", "HEAD"])
 async def live_ts_alias(stream_id: str, request: Request):
-    sid, is_hls = _find_http_output_stream(f"/live/{stream_id}")
+    sid, is_hls = _find_http_output_stream(f"/live/{stream_id}", _extract_request_port(request))
     target = sid or stream_id
     if is_hls or target.endswith(".m3u8"):
         return await play_hls(target[:-5] if target.endswith(".m3u8") else target, request)
@@ -1337,8 +1477,46 @@ async def live_ts_alias(stream_id: str, request: Request):
     return await play_stream(target, request)
 
 
+class AstraStaticOrStreamApp(StaticFiles):
+    """Serves custom HTTP OUTPUT LIST URLs (e.g. /1, /1.ts, /1/index.m3u8, /ch/sport)
+    before falling back to StaticFiles for the AstraG web UI."""
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["method"] in ("GET", "HEAD"):
+            request = Request(scope, receive=receive)
+            sid, mode, seg_name = _resolve_http_output(request.url.path, _extract_request_port(request))
+            if sid is not None:
+                try:
+                    if mode == "hls":
+                        response = await play_hls(sid, request)
+                    elif mode == "segment":
+                        response = await play_segment(sid, seg_name, request)
+                    else:
+                        response = await play_stream(sid, request)
+                except HTTPException as exc:
+                    response = JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
+                await response(scope, receive, send)
+                return
+            clean_p = request.url.path.strip("/")
+            if clean_p.endswith("/index.m3u8") and clean_p[:-11] in state.stream_configs:
+                try:
+                    response = await play_hls(clean_p[:-11], request)
+                except HTTPException as exc:
+                    response = JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
+                await response(scope, receive, send)
+                return
+            if clean_p.endswith(".ts") and clean_p[:-3] in state.stream_configs:
+                try:
+                    response = await play_stream(clean_p[:-3], request)
+                except HTTPException as exc:
+                    response = JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
+                await response(scope, receive, send)
+                return
+        await super().__call__(scope, receive, send)
+
+
 if STATIC_DIR.is_dir():
-    app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
+    app.mount("/", AstraStaticOrStreamApp(directory=str(STATIC_DIR), html=True), name="static")
 
 
 if __name__ == "__main__":

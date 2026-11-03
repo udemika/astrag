@@ -314,6 +314,89 @@ class _PSI:
         return result
 
 
+def _is_pes_video_keyframe(packet: bytes, offset: int) -> bool:
+    """Detect H.264 (SPS=7, IDR=5) or HEVC (VPS=32, SPS=33, IDR/CRA=19..21) keyframe in a PUSI TS packet."""
+    if offset + 9 > 188 or packet[offset:offset + 3] != b"\x00\x00\x01":
+        return False
+    es_pos = offset + 9 + packet[offset + 8]
+    if es_pos + 4 > 188:
+        return False
+    payload = packet[es_pos:]
+    idx = 0
+    limit = len(payload) - 4
+    while idx <= limit:
+        sc = payload.find(b"\x00\x00\x01", idx)
+        if sc < 0 or sc + 3 >= len(payload):
+            break
+        nal_byte = payload[sc + 3]
+        # H.264 SPS (7) or IDR (5) with forbidden_zero_bit == 0 and nal_ref_idc > 0
+        if nal_byte in (0x25, 0x45, 0x65, 0x27, 0x47, 0x67):
+            return True
+        # HEVC VPS (32), SPS (33), IDR/CRA (19, 20, 21) with 2-byte header (layer_id=0, tid=1 -> 0x01)
+        if nal_byte in (0x26, 0x28, 0x2A, 0x40, 0x42) and sc + 4 < len(payload) and payload[sc + 4] == 0x01:
+            return True
+        idx = sc + 4
+    return False
+
+
+def _extract_pcr_from_packet(data: bytes, pos: int):
+    """Return (pid, pcr) if the 188-byte TS packet at pos contains a valid 27MHz PCR, else None."""
+    if pos + 12 > len(data) or data[pos] != 0x47 or (data[pos + 1] & 0x80):
+        return None
+    afc = (data[pos + 3] >> 4) & 3
+    if not (afc & 2):
+        return None
+    length = data[pos + 4]
+    if length < 7 or 5 + length > 188 or not (data[pos + 5] & 0x10):
+        return None
+    b0, b1, b2, b3, b4, b5 = data[pos + 6:pos + 12]
+    base = (b0 << 25) | (b1 << 17) | (b2 << 9) | (b3 << 1) | (b4 >> 7)
+    ext = ((b4 & 1) << 8) | b5
+    if ext >= 300:
+        return None
+    pid = ((data[pos + 1] & 0x1F) << 8) | data[pos + 2]
+    return pid, base * 300 + ext
+
+
+def _segment_pcr_duration(data: bytes):
+    """Measure the exact 27MHz PCR duration of an aligned TS segment buffer."""
+    n = (len(data) // 188) * 188
+    if n < 188 * 4:
+        return None
+    first_pid = None
+    first_pcr = None
+    first_idx = 0
+    scan_limit = min(n, 188 * 2500)
+    for pos in range(0, scan_limit, 188):
+        res = _extract_pcr_from_packet(data, pos)
+        if res is not None:
+            first_pid, first_pcr = res
+            first_idx = pos // 188
+            break
+    if first_pcr is None:
+        return None
+    last_pcr = None
+    last_idx = 0
+    back_limit = max(first_idx * 188 + 188, n - 188 * 2500)
+    for pos in range(n - 188, back_limit - 1, -188):
+        res = _extract_pcr_from_packet(data, pos)
+        if res is not None and res[0] == first_pid:
+            last_pcr = res[1]
+            last_idx = pos // 188
+            break
+    if last_pcr is None or last_idx <= first_idx:
+        return None
+    delta_pcr = (last_pcr - first_pcr) % PCR_WRAP
+    dur = delta_pcr / PCR_HZ
+    if dur <= 0.1 or dur > 30.0:
+        return None
+    total_pkts = n // 188
+    span_pkts = last_idx - first_idx
+    if span_pkts > 0:
+        dur = dur * (total_pkts / span_pkts)
+    return dur
+
+
 @dataclass(frozen=True)
 class Segment:
     sequence: int
@@ -323,10 +406,10 @@ class Segment:
 
 
 class Engine:
-    def __init__(self, urls=(), outputs=None, *, queue_size=2048,
-                 segment_duration=2.0, max_segments=5,
-                 max_segment_bytes=2 * 1024 * 1024,
-                 max_hls_bytes=6 * 1024 * 1024, retry_delay=0.5,
+    def __init__(self, urls=(), outputs=None, *, queue_size=8192,
+                 segment_duration=2.0, max_segments=6,
+                 max_segment_bytes=8 * 1024 * 1024,
+                 max_hls_bytes=48 * 1024 * 1024, retry_delay=0.5,
                  udp_timeout=10.0, stream_options=None,
                  clock: Callable[[], float] = time.monotonic):
         if isinstance(urls, str):
@@ -381,6 +464,8 @@ class Engine:
         self._parsed_sdt = None
         self._parsed_nit = None
         self._preroll = bytearray()
+        self._seen_video_keyframes = False
+        self._current_has_keyframe = False
         self._active_input_id = 1
         self._active_url_opts = {}
         self._filter_keep_pids = None
@@ -632,6 +717,13 @@ class Engine:
                             elif 0xC0 <= stream_id <= 0xDF or stream_id == 0xBD:
                                 self._elementary_pids.setdefault(pid, "AUDIO")
 
+        is_video_keyframe = False
+        if not tei and not scrambled and payload:
+            is_video = self._elementary_pids.get(pid) == "VIDEO"
+            if is_video and (random_access or (pusi and _is_pes_video_keyframe(packet, offset))):
+                is_video_keyframe = True
+                self._seen_video_keyframes = True
+
         if (broken or discontinuity) and pid in self._psi:
             self._psi[pid].reset()
         if not tei and not scrambled and not duplicate and payload and pid in self._psi:
@@ -639,18 +731,32 @@ class Engine:
                 self._cache_table(pid, section, packets)
         if pid != 0x1FFF and not tei and not duplicate:
             self._observe_pcr(pid, pcr, discontinuity)
-            # Update bounded pre-roll buffer for instant VLC .ts startup
-            if random_access and self._elementary_pids.get(pid) == "VIDEO":
-                self._preroll.clear()
-            self._preroll.extend(packet)
-            if len(self._preroll) > PREROLL_MAX_BYTES:
-                excess = ((len(self._preroll) - PREROLL_MAX_BYTES + 187) // 188) * 188
-                del self._preroll[:excess]
-        self._hls_packet(packet)
+        self._hls_packet(packet, is_video_keyframe)
         for queue in self._subscribers:
             self._enqueue(queue, packet, "queue_drops")
         for _, _, queue in self._output_states:
             self._enqueue(queue, packet, "output_drops")
+
+    def is_video_keyframe_packet(self, packet: bytes) -> bool:
+        """Return True if packet is the start of a video keyframe (random_access or H.264/HEVC SPS/IDR)."""
+        if len(packet) != 188 or packet[0] != 0x47 or (packet[1] & 0x80) or (packet[3] & 0xC0):
+            return False
+        pid = ((packet[1] & 0x1F) << 8) | packet[2]
+        if self._elementary_pids.get(pid) != "VIDEO":
+            return False
+        afc = (packet[3] >> 4) & 3
+        offset = 4
+        random_access = False
+        if afc & 2:
+            length = packet[4]
+            offset += 1 + length
+            if length:
+                random_access = bool(packet[5] & 0x40)
+        if random_access:
+            return True
+        if (afc & 1) and (packet[1] & 0x40):
+            return _is_pes_video_keyframe(packet, offset)
+        return False
 
     def _observe_pcr(self, pid, pcr, discontinuity):
         if self._pcr_pid is None and pcr is not None:
@@ -852,12 +958,8 @@ class Engine:
         return self._synth_psi_prefix()
 
     def bootstrap_burst(self) -> bytes:
-        """Return PAT + PMT prefix followed by recent aligned TS packets for instant VLC playback."""
-        prefix = self._prefix()
-        preroll = bytes(self._preroll)
-        if not prefix and not preroll:
-            return b""
-        return prefix + preroll
+        """Return aligned PAT + PMT PSI tables for immediate demuxer lock without PCR drift."""
+        return self._prefix()
 
     def psi_summary(self) -> dict:
         """Return full Cesbo Astra Analyzer PSI/SI tables and stream metrics."""
@@ -903,17 +1005,34 @@ class Engine:
             return max(0.0, self._clock() - self._current_started)
         return 0.0
 
-    def _hls_packet(self, packet):
-        if self._current and (self._elapsed_segment() >= self.segment_duration or
-                              len(self._current) + 188 > self.max_segment_bytes):
-            self._finish_segment()
+    def _hls_packet(self, packet, is_video_keyframe=False):
+        if self._current:
+            elapsed = self._elapsed_segment()
+            if len(self._current) + 188 > self.max_segment_bytes:
+                self._finish_segment()
+            elif self._seen_video_keyframes:
+                # If the very first segment started mid-GOP before the first keyframe,
+                # realign segment-0 cleanly onto the first IDR keyframe.
+                if (not self._segments and is_video_keyframe and
+                        not self._current_has_keyframe and elapsed < self.segment_duration):
+                    self._current.clear()
+                    self._current_started = None
+                    self._current_pcr = None
+                elif (is_video_keyframe and elapsed >= self.segment_duration * 0.80) or (
+                        elapsed >= self.segment_duration * 1.80):
+                    self._finish_segment()
+            elif elapsed >= self.segment_duration:
+                self._finish_segment()
         if not self._current:
             self._current_started = self._clock()
             self._current_pcr = self._timeline if self._pcr_last is not None else None
+            self._current_has_keyframe = bool(is_video_keyframe)
             prefix = self._prefix()
             # Leave room for actual stream data even with unusually many tables.
             if len(prefix) + 188 <= self.max_segment_bytes:
                 self._current.extend(prefix)
+        elif is_video_keyframe:
+            self._current_has_keyframe = True
         self._current.extend(packet)
 
     def _finish_segment(self):
@@ -929,6 +1048,7 @@ class Engine:
         self._current.clear()
         self._current_started = None
         self._current_pcr = None
+        self._current_has_keyframe = False
         self._current_discontinuity = False
         while (len(self._segments) > self.max_segments or
                self._segment_bytes > self.max_hls_bytes):
@@ -936,16 +1056,13 @@ class Engine:
             self._segment_bytes -= len(old.data)
             self._evicted_discontinuities += int(old.discontinuity)
 
-    async def wait_for_hls(self, timeout: float = 3.0) -> bool:
-        """Wait briefly for the first HLS segment or flush an initial segment if ready."""
+    async def wait_for_hls(self, timeout: float = 4.0) -> bool:
+        """Wait for at least one complete keyframe-aligned HLS segment to be ready."""
         if self._segments:
             return True
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline and self._running:
             if self._segments:
-                return True
-            if len(self._current) >= 188 * 48 and self._elapsed_segment() >= 0.5:
-                self._finish_segment()
                 return True
             await asyncio.sleep(0.05)
         if not self._segments and len(self._current) >= 188 * 16:
@@ -1015,6 +1132,8 @@ class Engine:
                     self._break_timeline()
                     if switched_input:
                         self._preroll.clear()
+                        self._seen_video_keyframes = False
+                        self._current_has_keyframe = False
                         self._pcr_pid = None
                         self._tables.clear()
                         self._pat_sections.clear()
@@ -1039,9 +1158,9 @@ class Engine:
                 await asyncio.sleep(self.retry_delay)
 
     async def _stream_hls_playlist(self, client, playlist_url: str):
-        """Cesbo Astra sync_buffer HLS input: background segment prefetcher + smooth TS pacer."""
+        """Cesbo Astra sync_buffer HLS input: background segment prefetcher + PCR-locked VBR pacer."""
         seen_segments = OrderedDict()
-        prefetch_queue: asyncio.Queue = asyncio.Queue(maxsize=4)
+        prefetch_queue: asyncio.Queue = asyncio.Queue(maxsize=8)
         producer_error = None
 
         async def _prefetch_producer():
@@ -1064,7 +1183,7 @@ class Engine:
                         if first_load or consecutive_errors >= 8:
                             producer_error = exc
                             return
-                        await asyncio.sleep(0.4)
+                        await asyncio.sleep(0.35)
                         continue
 
                     text = resp.text
@@ -1098,8 +1217,9 @@ class Engine:
                             next_dur = None
 
                     if first_load and len(seg_entries) > 2:
-                        # Start 2 segments before live edge so sync_buffer immediately has lookahead
-                        for old_url, _ in seg_entries[:-2]:
+                        # Start up to 3 segments before live edge so sync_buffer holds a 2-segment RAM cushion
+                        keep_count = 3 if len(seg_entries) >= 3 else 2
+                        for old_url, _ in seg_entries[:-keep_count]:
                             seen_segments[old_url] = True
                     first_load = False
 
@@ -1108,7 +1228,7 @@ class Engine:
                         if not self._running:
                             return
                         seen_segments[seg_url] = True
-                        while len(seen_segments) > 150:
+                        while len(seen_segments) > 200:
                             seen_segments.popitem(last=False)
                         try:
                             seg_resp = await client.get(seg_url)
@@ -1126,14 +1246,21 @@ class Engine:
                             if consecutive_errors >= 8:
                                 producer_error = exc
                                 return
-                    poll_sleep = min(0.8, max(0.25, target_duration * 0.35)) if new_entries else 0.35
+                    qdepth = prefetch_queue.qsize()
+                    if qdepth <= 1:
+                        poll_sleep = 0.20
+                    elif new_entries:
+                        poll_sleep = min(0.50, max(0.20, target_duration * 0.25))
+                    else:
+                        poll_sleep = 0.30
                     await asyncio.sleep(poll_sleep)
             finally:
                 await prefetch_queue.put(None)
 
         producer_task = asyncio.create_task(_prefetch_producer())
         first_segment = True
-        chunk_bytes = 188 * 32  # 6,016 bytes (32 TS packets per paced slice)
+        chunk_bytes = 188 * 70  # 13,160 bytes (70 TS packets = 10 UDP MTU frames per slice)
+        seg_clock = None
         try:
             while self._running:
                 item = await prefetch_queue.get()
@@ -1147,10 +1274,17 @@ class Engine:
                     first_segment = False
                     continue
 
+                pcr_dur = _segment_pcr_duration(seg_data)
+                has_seg_pcr = pcr_dur is not None and 0.2 <= pcr_dur <= 25.0
+                if has_seg_pcr:
+                    effective_seg_dur = min(seg_dur, pcr_dur) if seg_dur > 0 else pcr_dur
+                else:
+                    effective_seg_dur = seg_dur
+
                 pos = 0
                 if first_segment:
-                    # Immediate bootstrap burst (~48 KB) so PAT/PMT and initial video lock instantly
-                    burst_len = min(total_len, 188 * 256)
+                    # Immediate bootstrap burst (~64 KB) so PAT/PMT and initial keyframe lock fast
+                    burst_len = min(total_len, 188 * 348)
                     self.feed(seg_data[:burst_len])
                     pos = burst_len
                     first_segment = False
@@ -1158,34 +1292,45 @@ class Engine:
                     if pos >= total_len:
                         continue
 
-                remaining_bytes = total_len - pos
-                num_steps = max(1, (remaining_bytes + chunk_bytes - 1) // chunk_bytes)
-                # Adaptive sync_buffer PLL pacing based on lookahead queue depth
-                qdepth = prefetch_queue.qsize()
-                if qdepth >= 2:
-                    pace_factor = 0.76
-                elif qdepth == 1:
-                    pace_factor = 0.90
-                else:
-                    pace_factor = 0.98
-                effective_dur = seg_dur * (remaining_bytes / total_len) * pace_factor
-                step_sleep = min(0.05, max(0.0, effective_dur / num_steps))
+                now = time.monotonic()
+                if seg_clock is None or now > seg_clock + 0.05:
+                    seg_clock = now
 
                 while pos < total_len and self._running:
-                    t0 = time.monotonic()
-                    end = min(total_len, pos + chunk_bytes)
-                    self.feed(seg_data[pos:end])
-                    pos = end
-                    # Re-check queue depth dynamically: if 2+ segments buffered, speed up slightly
-                    if prefetch_queue.qsize() >= 2 and step_sleep > 0.005:
-                        target_wait = step_sleep * 0.75
+                    step_bytes = min(chunk_bytes, total_len - pos)
+                    t_pcr_before = self._timeline
+                    self.feed(seg_data[pos:pos + step_bytes])
+                    pos += step_bytes
+                    if pos >= total_len:
+                        break
+                    pcr_delta = self._timeline - t_pcr_before
+
+                    # PLL cushion control: keep 1-2 full segments buffered in prefetch_queue
+                    qdepth = prefetch_queue.qsize()
+                    if qdepth >= 4:
+                        pace_factor = 0.85
+                    elif qdepth == 3:
+                        pace_factor = 0.95
+                    elif qdepth in (1, 2):
+                        pace_factor = 1.000
                     else:
-                        target_wait = step_sleep
-                    elapsed = time.monotonic() - t0
-                    wait = target_wait - elapsed
+                        pace_factor = 1.04
+
+                    if has_seg_pcr:
+                        if 0.0 < pcr_delta <= 0.35:
+                            slice_dur = pcr_delta
+                        else:
+                            slice_dur = 0.0
+                    else:
+                        slice_dur = effective_seg_dur * (step_bytes / total_len)
+
+                    seg_clock += slice_dur * pace_factor
+                    wait = seg_clock - time.monotonic()
                     if wait > 0.001:
                         await asyncio.sleep(wait)
                     else:
+                        if wait < -0.25:
+                            seg_clock = time.monotonic() - 0.25
                         await asyncio.sleep(0)
             if producer_error is not None:
                 raise producer_error
@@ -1201,7 +1346,14 @@ class Engine:
         ua = url_opts.get("ua") or "AstraG/2.0"
         timeout = httpx.Timeout(connect=conn_timeout, read=30.0, write=10.0, pool=10.0)
         limits = httpx.Limits(max_keepalive_connections=6, max_connections=12)
-        headers = {"User-Agent": ua, "Accept": "*/*", "Icy-MetaData": "0", "Connection": "keep-alive"}
+        headers = {
+            "User-Agent": ua,
+            "Accept": "*/*",
+            "Icy-MetaData": "0",
+            "Connection": "keep-alive",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
         async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, limits=limits, headers=headers) as client:
             if clean_url.lower().split("?", 1)[0].endswith((".m3u8", ".m3u")):
                 await self._stream_hls_playlist(client, clean_url)
@@ -1213,18 +1365,75 @@ class Engine:
                 if "mpegurl" in ctype or "m3u" in ctype:
                     switch_to_hls = True
                 else:
-                    first_chunk = True
-                    async for chunk in response.aiter_bytes(chunk_size=188 * 32):
-                        if not self._running:
-                            return
-                        if first_chunk:
-                            first_chunk = False
-                            stripped = chunk.lstrip()
-                            if stripped.startswith(b"#EXTM3U"):
-                                switch_to_hls = True
+                    raw_queue: asyncio.Queue = asyncio.Queue(maxsize=128)
+                    queued_bytes = 0
+                    reader_error = None
+
+                    async def _ts_reader():
+                        nonlocal switch_to_hls, queued_bytes, reader_error
+                        first_chunk = True
+                        try:
+                            async for chunk in response.aiter_bytes():
+                                if not self._running or not chunk:
+                                    break
+                                if first_chunk:
+                                    first_chunk = False
+                                    if chunk.lstrip().startswith(b"#EXTM3U"):
+                                        switch_to_hls = True
+                                        break
+                                queued_bytes += len(chunk)
+                                await raw_queue.put(chunk)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            reader_error = exc
+                        finally:
+                            await raw_queue.put(None)
+
+                    reader_task = asyncio.create_task(_ts_reader())
+                    slice_size = 188 * 70
+                    ts_clock = time.monotonic()
+                    try:
+                        while self._running:
+                            chunk = await raw_queue.get()
+                            if chunk is None:
                                 break
-                        self.feed(chunk)
-                        await asyncio.sleep(0)
+                            queued_bytes = max(0, queued_bytes - len(chunk))
+                            if queued_bytes <= 65536 and len(chunk) <= 65536:
+                                self.feed(chunk)
+                                ts_clock = time.monotonic()
+                                await asyncio.sleep(0)
+                            else:
+                                # Smooth bursty HTTP .ts upstream sources using 27MHz PCR deltas
+                                pos = 0
+                                total = len(chunk)
+                                now = time.monotonic()
+                                if now > ts_clock + 0.05:
+                                    ts_clock = now
+                                while pos < total and self._running:
+                                    step = min(slice_size, total - pos)
+                                    t_pcr0 = self._timeline
+                                    self.feed(chunk[pos:pos + step])
+                                    pos += step
+                                    pcr_delta = self._timeline - t_pcr0
+                                    rem_buffered = queued_bytes + (total - pos)
+                                    if rem_buffered > 32768 and 0.0 < pcr_delta <= 0.30:
+                                        factor = 0.85 if rem_buffered > 1024 * 1024 else 0.96
+                                        ts_clock += pcr_delta * factor
+                                        wait = ts_clock - time.monotonic()
+                                        if wait > 0.001:
+                                            await asyncio.sleep(wait)
+                                        else:
+                                            if wait < -0.25:
+                                                ts_clock = time.monotonic() - 0.25
+                                            await asyncio.sleep(0)
+                                    else:
+                                        await asyncio.sleep(0)
+                        if reader_error is not None:
+                            raise reader_error
+                    finally:
+                        reader_task.cancel()
+                        await asyncio.gather(reader_task, return_exceptions=True)
             if switch_to_hls and self._running:
                 await self._stream_hls_playlist(client, clean_url)
 

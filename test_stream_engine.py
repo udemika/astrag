@@ -366,6 +366,36 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["pmt"][0]["pnr"], 1)
         self.assertEqual(summary["pmt"][0]["streams"][0]["type_name"], "VIDEO")
 
+    def test_keyframe_detection_and_pcr_segment_duration(self):
+        from stream_engine import _segment_pcr_duration
+        clock = Clock()
+        engine = Engine(clock=clock, segment_duration=2.0)
+        pat_packet = packet(pid=0, payload=b"\x00" + pat(100), start=True)
+        pmt_packet = packet(pid=100, payload=b"\x00" + pmt(), start=True)
+        # Non-keyframe P-slice (NAL type 1) followed by H.264 SPS (NAL type 7) + IDR (NAL type 5)
+        p_slice = packet(pid=256, cc=0, pcr=0,
+                         payload=b"\x00\x00\x01\xe0\x00\x00\x80\x00\x00\x00\x00\x01\x41", start=True)
+        idr_kf1 = packet(pid=256, cc=1, pcr=int(0.5 * PCR_HZ),
+                         payload=b"\x00\x00\x01\xe0\x00\x00\x80\x00\x00\x00\x00\x01\x67\x42\x00\x1f\x00\x00\x01\x65",
+                         start=True)
+        idr_kf2 = packet(pid=256, cc=2, pcr=int(2.5 * PCR_HZ),
+                         payload=b"\x00\x00\x01\xe0\x00\x00\x80\x00\x00\x00\x00\x01\x65",
+                         start=True)
+        engine.feed(pat_packet + pmt_packet + p_slice)
+        self.assertFalse(engine.is_video_keyframe_packet(p_slice))
+        engine.feed(idr_kf1)
+        self.assertTrue(engine.is_video_keyframe_packet(idr_kf1))
+        self.assertTrue(engine._seen_video_keyframes)
+        # segment-0 should have been realigned to start at idr_kf1 (after PAT+PMT prefix)
+        engine.feed(idr_kf2)
+        seg0 = engine.get_segment(0)
+        self.assertIsNotNone(seg0)
+        self.assertEqual(seg0, pat_packet + pmt_packet + idr_kf1)
+        dur = _segment_pcr_duration(p_slice + packet(pid=256, cc=1) + packet(pid=256, cc=2) + idr_kf2)
+        self.assertIsNotNone(dur)
+        self.assertGreater(dur, 2.0)
+
 
 if __name__ == "__main__":
     unittest.main()
+

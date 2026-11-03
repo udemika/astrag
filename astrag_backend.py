@@ -133,8 +133,8 @@ def make_engine(config):
     except ImportError as exc:
         raise HTTPException(503, "Native stream engine unavailable") from exc
     hls_cfg = state.config.get("hls", {}) if "state" in globals() else {}
-    seg_dur = float(hls_cfg.get("duration") or 2.0)
-    max_segs = int(hls_cfg.get("quantity") or 5)
+    seg_dur = float(hls_cfg.get("duration") or 3.0)
+    max_segs = int(hls_cfg.get("quantity") or 6)
     seg_dur = max(1.0, min(15.0, seg_dur))
     max_segs = max(2, min(20, max_segs))
     return Engine(
@@ -684,6 +684,11 @@ app.add_middleware(
 )
 
 
+@app.get("/__health")
+async def health_check():
+    return {"status": "ok", "version": state.version}
+
+
 async def json_body(request):
     try:
         body = await request.json()
@@ -1146,7 +1151,7 @@ async def play_stream(stream_id: str, request: Request):
     sub_fn = engine.subscribe
     try:
         sig = inspect.signature(sub_fn)
-        queue = await maybe_await(sub_fn(8192) if len(sig.parameters) >= 1 else sub_fn())
+        queue = await maybe_await(sub_fn(16384) if len(sig.parameters) >= 1 else sub_fn())
     except (ValueError, TypeError):
         queue = await maybe_await(sub_fn())
     sid = state.next_session
@@ -1166,21 +1171,65 @@ async def play_stream(stream_id: str, request: Request):
 
     async def generate():
         try:
-            # Send immediate PAT + PMT + pre-roll burst once on connect so VLC locks immediately.
-            # Never re-inject cached PAT/PMT packets mid-stream when the stream has native PSI
-            # tables, because cached packets have static Continuity Counters (CC) that would
-            # trigger demuxer discontinuities and periodic playback freezes.
+            # Drain any packets queued prior to generator startup so there is zero overlap
+            while not queue.empty():
+                stale = queue.get_nowait()
+                if hasattr(queue, "task_done"):
+                    try:
+                        queue.task_done()
+                    except ValueError:
+                        pass
+                if stale is None:
+                    return
+
             burst_fn = getattr(engine, "bootstrap_burst", None)
-            if callable(burst_fn):
-                burst = burst_fn()
-                if burst:
-                    yield burst
+            kf_fn = getattr(engine, "is_video_keyframe_packet", None)
+            elem_pids = getattr(engine, "_elementary_pids", {}) or {}
+            wait_for_kf = bool(getattr(engine, "_seen_video_keyframes", False) and callable(kf_fn))
+            audio_pids = {pid for pid, tname in elem_pids.items() if tname == "AUDIO"}
+            audio_synced = set()
+            burst_sent = False
+
+            if not wait_for_kf:
+                if callable(burst_fn):
+                    burst = burst_fn()
+                    if burst:
+                        yield burst
+                burst_sent = True
+
+            kf_deadline = time.monotonic() + 1.2
+            skipped_packets = 0
             synth_fn = getattr(engine, "_synth_psi_prefix", None)
             batches_since_psi = 0
+
             while True:
                 first = await queue.get()
                 if first is None:
                     break
+
+                if not burst_sent:
+                    if kf_fn(first) or time.monotonic() >= kf_deadline or skipped_packets >= 4500:
+                        burst_sent = True
+                        if callable(burst_fn):
+                            burst = burst_fn()
+                            if burst:
+                                yield burst + first
+                            else:
+                                yield first
+                        else:
+                            yield first
+                    else:
+                        skipped_packets += 1
+                    continue
+
+                if audio_pids and len(audio_synced) < len(audio_pids) and len(first) == 188:
+                    pid = ((first[1] & 0x1F) << 8) | first[2]
+                    if pid in audio_pids and pid not in audio_synced:
+                        if first[1] & 0x40:
+                            audio_synced.add(pid)
+                        else:
+                            continue
+
                 # Coalesce available packets in queue into up to 32 KB (174 * 188 = 32712 bytes)
                 if not queue.empty():
                     buf = bytearray(first)
@@ -1190,6 +1239,13 @@ async def play_stream(stream_id: str, request: Request):
                         if nxt is None:
                             eos = True
                             break
+                        if audio_pids and len(audio_synced) < len(audio_pids) and len(nxt) == 188:
+                            pid = ((nxt[1] & 0x1F) << 8) | nxt[2]
+                            if pid in audio_pids and pid not in audio_synced:
+                                if nxt[1] & 0x40:
+                                    audio_synced.add(pid)
+                                else:
+                                    continue
                         buf.extend(nxt)
                     batches_since_psi += 1
                     if batches_since_psi >= 250 and callable(synth_fn) and not getattr(engine, "_tables", None):

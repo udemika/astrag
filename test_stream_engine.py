@@ -352,6 +352,20 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine._tasks, [])
         await engine.stop()
 
+    def test_psi_summary_and_bootstrap_burst(self):
+        engine = Engine()
+        pat_packet = packet(pid=0, payload=b"\x00" + pat(100), start=True)
+        pmt_packet = packet(pid=100, payload=b"\x00" + pmt(), start=True)
+        pes_video = packet(pid=256, cc=0, payload=b"\x00\x00\x01\xe0\x00\x00\x80\x00\x00", start=True)
+        engine.feed(pat_packet + pmt_packet + pes_video)
+        burst = engine.bootstrap_burst()
+        self.assertTrue(burst.startswith(pat_packet + pmt_packet))
+        self.assertEqual(len(burst) % 188, 0)
+        summary = engine.psi_summary()
+        self.assertEqual(summary["pat"]["tsid"], 1)
+        self.assertEqual(summary["pmt"][0]["pnr"], 1)
+        self.assertEqual(summary["pmt"][0]["streams"][0]["type_name"], "VIDEO")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,8 +1,8 @@
-"""Async management API and native transport integration for the local media server.
+"""AstraG async management API and Cesbo Astra-compatible transport server.
 
-HLS is an in-memory MPEG-TS remux, not a transcoder; codec/keyframe compatibility
-is the caller's responsibility. DVB hardware and conditional access execution are
-not implemented (their configuration can be stored).
+Supports MPEG-TS (.ts) and HLS (.m3u8) inputs and outputs over HTTP/HTTPS/UDP/RTP,
+full PSI/SI stream analysis (PAT/PMT/SDT/NIT), multi-input failover, multi-port
+public IPTV listeners, and account management.
 """
 import argparse
 import asyncio
@@ -30,10 +30,29 @@ from account_security import FailedAuthLimiter, hash_password, valid_login, vali
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-logger = logging.getLogger("astra.backend")
+logger = logging.getLogger("astrag.backend")
 APP_DIR = Path(__file__).resolve().parent
-CONFIG_FILE = Path(os.environ.get("ASTRA_CONFIG_FILE", APP_DIR / "astra-clone.conf"))
-STATE_FILE = Path(os.environ.get("ASTRA_STATE_FILE", APP_DIR / "state.json"))
+
+
+def _default_config_file() -> Path:
+    if "ASTRA_CONFIG_FILE" in os.environ:
+        return Path(os.environ["ASTRA_CONFIG_FILE"])
+    for candidate in (Path("/etc/astrag/astrag.conf"), APP_DIR / "astrag.conf", APP_DIR / "astra-clone.conf"):
+        if candidate.exists():
+            return candidate
+    return APP_DIR / "astrag.conf"
+
+
+def _default_state_file() -> Path:
+    if "ASTRA_STATE_FILE" in os.environ:
+        return Path(os.environ["ASTRA_STATE_FILE"])
+    if Path("/var/lib/astrag").is_dir():
+        return Path("/var/lib/astrag/state.json")
+    return APP_DIR / "state.json"
+
+
+CONFIG_FILE = _default_config_file()
+STATE_FILE = _default_state_file()
 
 FAVICON_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
@@ -106,7 +125,18 @@ def make_engine(config):
         from stream_engine import Engine
     except ImportError as exc:
         raise HTTPException(503, "Native stream engine unavailable") from exc
-    return Engine(config["input"], outputs=config.get("output", []))
+    hls_cfg = state.config.get("hls", {}) if "state" in globals() else {}
+    seg_dur = float(hls_cfg.get("duration") or 2.0)
+    max_segs = int(hls_cfg.get("quantity") or 5)
+    seg_dur = max(1.0, min(15.0, seg_dur))
+    max_segs = max(2, min(20, max_segs))
+    return Engine(
+        config["input"],
+        outputs=config.get("output", []),
+        segment_duration=seg_dur,
+        max_segments=max_segs,
+        stream_options=config,
+    )
 
 
 _DEFAULT_ADMIN_HASH = hash_password("admin")
@@ -229,15 +259,23 @@ class ServerState:
         self.config = defaults()
         self.engines = {}
         self.sessions = {}
+        self.scans = {}
         self.websocket_clients = {}
         self.auth_limiter = FailedAuthLimiter()
         self.next_session = 1
         self.started = time.time()
-        self.version = "native-python 2.0"
-        self.commit = os.environ.get("ASTRA_COMMIT", "local")
+        self.version = "AstraG 2.0"
+        self.commit = os.environ.get("ASTRA_COMMIT", "astrag")
         self.logs = []
         self.lock = asyncio.Lock()
         self.extra_servers = {}
+
+    def add_log(self, level: str, text: str):
+        entry = {"type": level, "time": int(time.time()), "text": text}
+        self.logs.append(entry)
+        if len(self.logs) > 500:
+            del self.logs[:len(self.logs) - 500]
+        return entry
 
     @property
     def stream_configs(self):
@@ -251,6 +289,13 @@ class ServerState:
                 q.get_nowait()
             q.put_nowait(None)
         return session is not None
+
+    async def stop_scans(self):
+        for scan_id, task in list(self.scans.items()):
+            task.cancel()
+        if self.scans:
+            await asyncio.gather(*self.scans.values(), return_exceptions=True)
+        self.scans.clear()
 
     async def stop_engines(self):
         for sid in list(self.sessions):
@@ -372,20 +417,52 @@ async def publish_stats():
                 if not isinstance(stats, dict):
                     continue
                 stats = dict(stats)
-                stats["bitrate"] = stats.get("bitrate", 0) / 1000
-                stats["onair"] = bool(stats.get("running") and stats["bitrate"])
-                stats["cc_error"] = stats.get("cc_errors", 0)
+                raw_br = stats.get("effective_bitrate", stats.get("bitrate", 0)) or 0
+                stats["bitrate"] = int(round(raw_br / 1000))
+                stats["onair"] = bool(stats.get("running") and stats["bitrate"] > 0)
+                stats["cc_error"] = stats.get("cc_errors", stats.get("continuity_errors", 0))
                 stats["pes_error"] = stats.get("pes_errors", 0)
                 stats["scrambled"] = bool(stats.get("scrambled", False))
+                input_id = int(stats.get("input_id", 1))
                 await state.broadcast("stream_event", {
-                    **stats, "channel_id": sid, "input_id": 1,
-                    "sessions": sum(s["channel_id"] == sid for s in state.sessions.values()),
+                    **stats, "channel_id": sid, "input_id": input_id,
+                    "sessions": sum(s.get("channel_id") == sid for s in state.sessions.values()),
                 })
             except Exception:
                 logger.exception("Unable to publish stream statistics")
 
 
 state = ServerState()
+
+
+async def _run_stream_analyzer(scan_id: str, stream_id: str):
+    """Push real-time Cesbo Astra PSI/SI and bitrate telemetry for StreamsModule.startAnalyze."""
+    try:
+        while scan_id in state.scans:
+            engine = state.engines.get(stream_id)
+            if engine is not None and hasattr(engine, "psi_summary"):
+                summary = engine.psi_summary()
+                if summary.get("pat"):
+                    await state.broadcast("scan", {"data": summary["pat"]})
+                for pmt in summary.get("pmt") or []:
+                    await state.broadcast("scan", {"data": pmt})
+                if summary.get("sdt"):
+                    await state.broadcast("scan", {"data": summary["sdt"]})
+                if summary.get("nit"):
+                    await state.broadcast("scan", {"data": summary["nit"]})
+                await state.broadcast("scan", {"data": {"analyze": True, "total": summary["total"]}})
+            else:
+                await state.broadcast("scan", {
+                    "data": {
+                        "analyze": True,
+                        "total": {"bitrate": 0, "cc_errors": 0, "pes_errors": 0, "scrambled": False},
+                    }
+                })
+            await asyncio.sleep(1.0)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        state.scans.pop(scan_id, None)
 
 
 def identity(credentials, require_credentials=False):
@@ -518,6 +595,7 @@ async def reload_config():
 async def lifespan(app):
     state.lock = asyncio.Lock()
     await reload_config()
+    state.add_log("info", f"{state.version} started on {HOST}:{PORT}")
     loop = asyncio.get_running_loop()
     installed = False
     if hasattr(signal, "SIGHUP") and os.name != "nt":
@@ -534,6 +612,7 @@ async def lifespan(app):
         await asyncio.gather(stats_task, return_exceptions=True)
         if installed:
             loop.remove_signal_handler(signal.SIGHUP)
+        await state.stop_scans()
         await state.stop_extra_ports()
         await state.stop_engines()
         for ws in list(state.websocket_clients):
@@ -541,7 +620,7 @@ async def lifespan(app):
         state.websocket_clients.clear()
 
 
-app = FastAPI(title="Native Media Server", version="2.0", lifespan=lifespan)
+app = FastAPI(title="AstraG Media Server", version="2.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -569,7 +648,7 @@ def object_payload(body, name):
 
 def session_list():
     return [dict({k: v for k, v in s.items() if k not in ("queue", "engine", "started")},
-                 uptime=int(time.time() - s["started"])) for s in state.sessions.values()]
+                 uptime=int(time.time() - s.get("started", time.time()))) for s in state.sessions.values()]
 
 
 @app.post("/control/")
@@ -592,6 +671,20 @@ async def control_api(request: Request):
     if cmd == "log":
         return {"log": list(state.logs)}
     admin(user)
+    if cmd == "scan-init":
+        scan_target = body.get("scan")
+        if isinstance(scan_target, str) and scan_target.startswith("stream://"):
+            stream_id = scan_target[len("stream://"):]
+            scan_id = uuid.uuid4().hex[:10]
+            state.scans[scan_id] = asyncio.create_task(_run_stream_analyzer(scan_id, stream_id))
+            return {"scan-init": "ok", "id": scan_id}
+        raise HTTPException(501, "DVB hardware operations are not implemented")
+    if cmd == "scan-kill":
+        scan_id = body.get("id")
+        task = state.scans.pop(scan_id, None)
+        if task:
+            task.cancel()
+        return {"scan-kill": "ok", "success": True}
     if cmd.startswith("scan-") or cmd in ("restart-adapter",):
         raise HTTPException(501, "DVB hardware operations are not implemented")
     if cmd == "close-session":
@@ -605,6 +698,7 @@ async def control_api(request: Request):
     async with state.lock:
         if cmd == "restart":
             await state.apply(disk_config(), persist=False)
+            state.add_log("info", "Configuration and streams reloaded")
             return {"success": True, "message": "Configuration and engines reloaded; process not restarted"}
         config = copy.deepcopy(state.config)
         event = {}
@@ -633,8 +727,10 @@ async def control_api(request: Request):
             config["make_stream"] = [s for s in config["make_stream"] if s["id"] != sid]
             if not data.get("remove", body.get("remove", False)):
                 config["make_stream"].append(data)
+                state.add_log("info", f"Stream '{data.get('name', sid)}' ({sid}) saved")
             else:
                 data["remove"] = True
+                state.add_log("warning", f"Stream '{sid}' removed")
             event = {"id": sid, "stream": data}
             result["id"] = sid
         elif cmd == "set-stream-input":
@@ -901,18 +997,20 @@ async def control_event_websocket(websocket: WebSocket):
 
 def media_engine(stream_id, request):
     user = require_media_auth(request)
+    if stream_id not in state.stream_configs and stream_id.endswith(".ts") and stream_id[:-3] in state.stream_configs:
+        stream_id = stream_id[:-3]
     if stream_id not in state.stream_configs:
         raise HTTPException(404, "Stream not found")
     engine = state.engines.get(stream_id)
     if engine is None:
         raise HTTPException(409, "Stream disabled or has no input")
-    return engine, user
+    return engine, user, stream_id
 
 
-@app.get("/play/{stream_id}.m3u8")
-@app.get("/play/{stream_id}/index.m3u8")
+@app.api_route("/play/{stream_id}.m3u8", methods=["GET", "HEAD"])
+@app.api_route("/play/{stream_id}/index.m3u8", methods=["GET", "HEAD"])
 async def play_hls(stream_id: str, request: Request):
-    engine, _ = media_engine(stream_id, request)
+    engine, _, stream_id = media_engine(stream_id, request)
     if "udp" in request.query_params:
         raise HTTPException(501, "UDP playlist discovery is not supported")
     token = request.query_params.get("token")
@@ -920,25 +1018,35 @@ async def play_hls(stream_id: str, request: Request):
     if "ts" in request.query_params:
         return Response(f"#EXTM3U\n/play/{stream_id}{token_qs}\n", media_type="audio/x-mpegurl")
     segmenter = getattr(engine, "hls", engine)
+    wait_fn = getattr(segmenter, "wait_for_hls", None)
+    if callable(wait_fn):
+        await maybe_await(wait_fn(timeout=3.0))
     method = (getattr(segmenter, "hls_playlist", None) or getattr(segmenter, "playlist", None)
               or getattr(segmenter, "get_playlist", None))
     if not callable(method):
         raise HTTPException(501, "Engine does not support HLS playlists")
     playlist = await maybe_await(method())
     if not playlist or "#EXTINF:" not in playlist:
-        raise HTTPException(503, "HLS segments not yet available", headers={"Retry-After": "2"})
+        raise HTTPException(503, "HLS segments not yet available", headers={"Retry-After": "1"})
     # Segment URLs remain within the authenticated media route.
     lines = [
         f"/play/{stream_id}/segment/{line}{token_qs}" if line and not line.startswith(("#", "/", "http")) else line
         for line in playlist.splitlines()
     ]
-    return Response("\n".join(lines) + "\n", media_type="application/vnd.apple.mpegurl",
-                    headers={"Cache-Control": "no-store"})
+    body = "" if request.method == "HEAD" else ("\n".join(lines) + "\n")
+    return Response(
+        body,
+        media_type="application/vnd.apple.mpegurl",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
 
 
-@app.get("/play/{stream_id}/segment/{segment_name}")
+@app.api_route("/play/{stream_id}/segment/{segment_name}", methods=["GET", "HEAD"])
 async def play_segment(stream_id: str, segment_name: str, request: Request):
-    engine, _ = media_engine(stream_id, request)
+    engine, _, stream_id = media_engine(stream_id, request)
     segmenter = getattr(engine, "hls", engine)
     method = getattr(segmenter, "get_segment", None)
     if not callable(method):
@@ -954,14 +1062,38 @@ async def play_segment(stream_id: str, segment_name: str, request: Request):
     data = await maybe_await(method(argument))
     if data is None:
         raise HTTPException(404, "Segment not found or expired")
-    return Response(data, media_type="video/mp2t")
+    if request.method == "HEAD":
+        return Response(b"", media_type="video/mp2t", headers={"Content-Length": str(len(data))})
+    return Response(
+        data,
+        media_type="video/mp2t",
+        headers={
+            "Cache-Control": "public, max-age=60",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
 
 
-@app.get("/play/{stream_id}.ts")
-@app.get("/play/{stream_id}")
+@app.api_route("/play/{stream_id}", methods=["GET", "HEAD"])
+@app.api_route("/play/{stream_id}.ts", methods=["GET", "HEAD"])
 async def play_stream(stream_id: str, request: Request):
-    engine, user = media_engine(stream_id, request)
-    queue = await maybe_await(engine.subscribe())
+    engine, user, stream_id = media_engine(stream_id, request)
+    if request.method == "HEAD":
+        return Response(
+            b"",
+            media_type="video/mp2t",
+            headers={
+                "Cache-Control": "no-store",
+                "Accept-Ranges": "none",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+    sub_fn = engine.subscribe
+    try:
+        sig = inspect.signature(sub_fn)
+        queue = await maybe_await(sub_fn(4096) if len(sig.parameters) >= 1 else sub_fn())
+    except (ValueError, TypeError):
+        queue = await maybe_await(sub_fn())
     sid = state.next_session
     state.next_session += 1
     state.sessions[sid] = {
@@ -979,15 +1111,66 @@ async def play_stream(stream_id: str, request: Request):
 
     async def generate():
         try:
+            # Send immediate PAT + PMT + pre-roll burst so VLC locks onto video/audio immediately
+            burst_fn = getattr(engine, "bootstrap_burst", None)
+            if callable(burst_fn):
+                burst = burst_fn()
+                if burst:
+                    yield burst
+            prefix_fn = getattr(engine, "_prefix", None)
+            batches_since_psi = 0
             while True:
-                chunk = await queue.get()
-                if chunk is None:
+                first = await queue.get()
+                if first is None:
                     break
-                yield chunk
+                # Coalesce available packets in queue into up to 32 KB (174 * 188 = 32712 bytes)
+                if not queue.empty():
+                    buf = bytearray(first)
+                    eos = False
+                    while len(buf) + 188 <= 32712 and not queue.empty():
+                        nxt = queue.get_nowait()
+                        if nxt is None:
+                            eos = True
+                            break
+                        buf.extend(nxt)
+                    batches_since_psi += 1
+                    if batches_since_psi >= 250 and callable(prefix_fn):
+                        batches_since_psi = 0
+                        psi = prefix_fn()
+                        if psi:
+                            yield psi + bytes(buf)
+                        else:
+                            yield bytes(buf)
+                    else:
+                        yield bytes(buf)
+                    if eos:
+                        break
+                else:
+                    batches_since_psi += 1
+                    if batches_since_psi >= 500 and callable(prefix_fn):
+                        batches_since_psi = 0
+                        psi = prefix_fn()
+                        if psi:
+                            yield psi + first
+                        else:
+                            yield first
+                    else:
+                        yield first
         finally:
             state.sessions.pop(sid, None)
             await maybe_await(engine.unsubscribe(queue))
-    return StreamingResponse(generate(), media_type="video/mp2t", headers={"Cache-Control": "no-store"})
+
+    return StreamingResponse(
+        generate(),
+        media_type="video/mp2t",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache",
+            "Accept-Ranges": "none",
+            "Access-Control-Allow-Origin": "*",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 def _playlist_base_url(request: Request):
@@ -1014,6 +1197,7 @@ def _build_m3u_playlist(request: Request):
         and bool(settings.get("http_play_hls"))
         and not settings.get("http_play_stream", True)
     )
+    use_ts_ext = "ts" in request.query_params
     token = request.query_params.get("token")
     token_qs = f"?token={token}" if token else ""
     arrange = settings.get("playlist_arrange")
@@ -1030,7 +1214,7 @@ def _build_m3u_playlist(request: Request):
                 attrs.append(f'group-title="{grp}"')
         extinf = f"#EXTINF:-1 {' '.join(attrs)},{name}"
         lines.append(extinf)
-        suffix = ".m3u8" if use_hls else ""
+        suffix = ".m3u8" if use_hls else (".ts" if use_ts_ext else "")
         lines.append(f"{base}/play/{sid}{suffix}{token_qs}")
     return Response("\n".join(lines) + "\n", media_type="audio/x-mpegurl", headers={"Cache-Control": "no-store"})
 
@@ -1038,7 +1222,7 @@ def _build_m3u_playlist(request: Request):
 def _build_xspf_playlist(request: Request):
     require_media_auth(request)
     settings = state.config.get("settings", {})
-    title = xml_escape(str(settings.get("http_play_xspf_title") or "Astra IPTV Playlist"))
+    title = xml_escape(str(settings.get("http_play_xspf_title") or "AstraG IPTV Playlist"))
     base = _playlist_base_url(request)
     token = request.query_params.get("token")
     token_qs = f"?token={token}" if token else ""
@@ -1099,8 +1283,8 @@ async def account_page():
     })
 
 
-@app.get("/{custom_name}.m3u8")
-@app.get("/{custom_name}.m3u")
+@app.api_route("/{custom_name}.m3u8", methods=["GET", "HEAD"])
+@app.api_route("/{custom_name}.m3u", methods=["GET", "HEAD"])
 async def custom_m3u_playlist(custom_name: str, request: Request):
     configured = state.config.get("settings", {}).get("http_play_playlist_name") or "playlist"
     if custom_name == configured:
@@ -1132,17 +1316,24 @@ def _find_http_output_stream(path: str):
     return None, False
 
 
-@app.get("/live/{stream_id}.m3u8")
+@app.api_route("/live/{stream_id}.m3u8", methods=["GET", "HEAD"])
 async def live_hls_alias(stream_id: str, request: Request):
     return await play_hls(stream_id, request)
 
 
-@app.get("/live/{stream_id}")
+@app.api_route("/live/{stream_id}.ts", methods=["GET", "HEAD"])
+async def live_ts_ext_alias(stream_id: str, request: Request):
+    return await play_stream(stream_id, request)
+
+
+@app.api_route("/live/{stream_id}", methods=["GET", "HEAD"])
 async def live_ts_alias(stream_id: str, request: Request):
     sid, is_hls = _find_http_output_stream(f"/live/{stream_id}")
     target = sid or stream_id
     if is_hls or target.endswith(".m3u8"):
         return await play_hls(target[:-5] if target.endswith(".m3u8") else target, request)
+    if target.endswith(".ts") and target[:-3] in state.stream_configs:
+        target = target[:-3]
     return await play_stream(target, request)
 
 
@@ -1151,7 +1342,7 @@ if STATIC_DIR.is_dir():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Astra-compatible media & control server")
+    parser = argparse.ArgumentParser(description="AstraG media & control server")
     parser.add_argument("-p", "--port", type=int, default=PORT, help="Primary HTTP/IPTV port (default: %(default)s)")
     parser.add_argument("--host", default=HOST, help="Bind address (default: %(default)s)")
     args, _ = parser.parse_known_args()

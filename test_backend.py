@@ -244,6 +244,13 @@ class BackendTests(unittest.TestCase):
         self.assertIsNone(queue.get_nowait())
         self.assertEqual(self.cmd("close-session", id="17").status_code, 422)
         self.assertEqual(self.cmd("close-session", id=17).status_code, 404)
+        self.assertEqual(self.client.head("/play/one.ts").status_code, 200)
+        self.assertEqual(self.client.head("/play/one.m3u8").status_code, 200)
+        scan_resp = self.cmd("scan-init", scan="stream://one")
+        self.assertEqual(scan_resp.status_code, 200)
+        self.assertEqual(scan_resp.json()["scan-init"], "ok")
+        scan_id = scan_resp.json()["id"]
+        self.assertEqual(self.cmd("scan-kill", id=scan_id).status_code, 200)
 
 
 if __name__ == "__main__":

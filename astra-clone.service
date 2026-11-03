@@ -1,28 +1,28 @@
 [Unit]
-Description=Astra-compatible control and IPTV streaming server
+Description=AstraG Control Panel and IPTV Streaming Server
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=astra-clone
-Group=astra-clone
-WorkingDirectory=/opt/astra-clone
+User=astrag
+Group=astrag
+WorkingDirectory=/opt/astrag
 Environment="PYTHONUNBUFFERED=1"
 Environment="PYTHONDONTWRITEBYTECODE=1"
 Environment="ASTRA_HOST=0.0.0.0"
 Environment="ASTRA_PORT=8000"
-Environment="ASTRA_STATIC_DIR=/opt/astra-clone/www"
-Environment="ASTRA_STATE_FILE=/var/lib/astra-clone/state.json"
-Environment="ASTRA_CONFIG_FILE=/etc/astra-clone/astra-clone.conf"
-EnvironmentFile=-/etc/astra-clone/astra-clone.conf
-ExecStart=/opt/astra-clone/venv/bin/python /opt/astra-clone/astra_clone_backend.py
+Environment="ASTRA_STATIC_DIR=/opt/astrag/www"
+Environment="ASTRA_STATE_FILE=/var/lib/astrag/state.json"
+Environment="ASTRA_CONFIG_FILE=/etc/astrag/astrag.conf"
+EnvironmentFile=-/etc/astrag/astrag.conf
+ExecStart=/opt/astrag/venv/bin/python /opt/astrag/astra_clone_backend.py
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
-RuntimeDirectory=astra-clone
+RuntimeDirectory=astrag
 RuntimeDirectoryMode=0750
-StateDirectory=astra-clone
+StateDirectory=astrag
 StateDirectoryMode=0750
 UMask=0027
 StandardOutput=journal
@@ -33,7 +33,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/var/lib/astra-clone /run/astra-clone
+ReadWritePaths=/var/lib/astrag /run/astrag
 LimitNOFILE=65536
 
 [Install]

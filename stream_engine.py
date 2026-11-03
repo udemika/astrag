@@ -1,4 +1,4 @@
-"""Independent asyncio MPEG-TS transport engine (no transcoder).
+"""AstraG native asyncio MPEG-TS & HLS transport engine (Cesbo Astra-compatible).
 
 Use ``await Engine(urls, outputs=[]).start()``; ``subscribe()`` returns a bounded
 asyncio.Queue containing 188-byte packets and finally END_OF_STREAM (None).
@@ -6,12 +6,13 @@ Call unsubscribe(queue) or await stop() to close subscriptions. feed(bytes) is
 synchronous and may also be used without start(). All methods belong on one
 asyncio event-loop thread. Overflow drops the oldest queued packet.
 
-Inputs: HTTP(S), udp://[address]:port, rtp://[address]:port. IPv4 multicast
-supports ?interface=192.0.2.1; outputs support udp://host:port?ttl=1. Multiple
-inputs are ordered failover sources, never interleaved. HTTP requires httpx.
-RAM HLS is a packet-aligned sliding window, NOT keyframe-aligned or guaranteed
-independently decodable. PCR drives durations when available; otherwise arrival
-time is an estimate. Only completed segments appear in the playlist.
+Inputs: HTTP(S) (both direct MPEG-TS and HLS .m3u8/.m3u master/media playlists),
+udp://[address]:port, rtp://[address]:port. IPv4 multicast supports
+?interface=192.0.2.1 or #localaddr=192.0.2.1; outputs support udp://host:port?ttl=1.
+Multiple inputs are ordered failover sources, never interleaved.
+Includes full MPEG-TS PSI/SI demuxing (PAT, PMT, SDT, NIT), PES error checking,
+scrambling detection, Astra URL #options filtering, pre-roll keyframe burst for
+instant VLC .ts playback, and low-memory sliding-window HLS segmentation.
 """
 from __future__ import annotations
 
@@ -23,12 +24,30 @@ import math
 import socket
 import time
 from typing import Callable
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 PACKET_SIZE = 188
 PCR_HZ = 27_000_000
 PCR_WRAP = (1 << 33) * 300
 END_OF_STREAM = None
+MAX_TRACKED_PIDS = 256
+PREROLL_MAX_BYTES = 188 * 256  # 48 KB (~256 TS packets) pre-roll burst for instant VLC lock
+
+# Elementary stream type classification (ISO/IEC 13818-1 & DVB)
+STREAM_TYPE_CATEGORIES = {
+    0x01: "VIDEO",  # MPEG-1 Video
+    0x02: "VIDEO",  # MPEG-2 Video
+    0x03: "AUDIO",  # MPEG-1 Audio
+    0x04: "AUDIO",  # MPEG-2 Audio
+    0x06: "DATA",   # PES private data (AC-3, Teletext, Subtitles)
+    0x0F: "AUDIO",  # AAC ADTS
+    0x10: "VIDEO",  # MPEG-4 Visual
+    0x11: "AUDIO",  # AAC LATM
+    0x1B: "VIDEO",  # H.264 / AVC
+    0x24: "VIDEO",  # H.265 / HEVC
+    0x81: "AUDIO",  # ATSC AC-3
+    0x87: "AUDIO",  # E-AC-3
+}
 
 if not hasattr(asyncio.BaseEventLoop, "sock_recvfrom"):
     async def _sock_recvfrom(self, sock, bufsize):
@@ -91,6 +110,115 @@ if not hasattr(asyncio.BaseEventLoop, "sock_recvfrom"):
     asyncio.AbstractEventLoop.sock_sendto = _sock_sendto
     asyncio.BaseEventLoop.sock_recvfrom = _sock_recvfrom
     asyncio.BaseEventLoop.sock_sendto = _sock_sendto
+
+
+def crc32_mpeg(data: bytes) -> int:
+    crc = 0xFFFFFFFF
+    for value in data:
+        crc ^= value << 24
+        for _ in range(8):
+            crc = ((crc << 1) ^ (0x04C11DB7 if crc & 0x80000000 else 0)) & 0xFFFFFFFF
+    return crc
+
+
+def build_psi_packet(pid: int, table_id: int, body: bytes, cc: int = 0) -> bytes:
+    length = len(body) + 4
+    sec = bytes([table_id, 0xB0 | ((length >> 8) & 0x0F), length & 0xFF]) + body
+    sec += crc32_mpeg(sec).to_bytes(4, "big")
+    header = bytes([0x47, 0x40 | ((pid >> 8) & 0x1F), pid & 0xFF, 0x10 | (cc & 0x0F), 0x00])
+    pkt = header + sec
+    if len(pkt) < 188:
+        pkt += b"\xff" * (188 - len(pkt))
+    return pkt[:188]
+
+
+def parse_astra_url_options(url: str) -> dict:
+    """Extract Cesbo Astra #key=value&flag options from an input/output URL."""
+    if "#" not in url:
+        return {}
+    fragment = url.split("#", 1)[1]
+    opts = {}
+    for part in fragment.split("&"):
+        if not part:
+            continue
+        if "=" in part:
+            k, v = part.split("=", 1)
+            opts[k.strip()] = v.strip()
+        else:
+            opts[part.strip()] = True
+    return opts
+
+
+def _decode_dvb_text(raw: bytes) -> str:
+    if not raw:
+        return ""
+    first = raw[0]
+    if first < 0x20:
+        if first == 0x15:
+            return raw[1:].decode("utf-8", errors="replace").strip()
+        if first in (0x01, 0x02, 0x03, 0x04, 0x05):
+            enc = {1: "iso-8859-5", 2: "iso-8859-6", 3: "iso-8859-7", 4: "iso-8859-8", 5: "iso-8859-9"}[first]
+            return raw[1:].decode(enc, errors="replace").strip()
+        if first == 0x10 and len(raw) >= 3:
+            code = (raw[1] << 8) | raw[2]
+            enc = f"iso-8859-{code}" if 1 <= code <= 15 else "utf-8"
+            try:
+                return raw[3:].decode(enc, errors="replace").strip()
+            except LookupError:
+                return raw[3:].decode("utf-8", errors="replace").strip()
+        raw = raw[1:]
+    try:
+        return raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return raw.decode("iso-8859-1", errors="replace").strip()
+
+
+def _parse_descriptors(buf: bytes) -> list:
+    out = []
+    pos = 0
+    end = len(buf)
+    while pos + 2 <= end:
+        tag = buf[pos]
+        length = buf[pos + 1]
+        pos += 2
+        if pos + length > end:
+            break
+        payload = buf[pos:pos + length]
+        pos += length
+        if tag == 0x09 and length >= 4:  # CA descriptor
+            caid = (payload[0] << 8) | payload[1]
+            ca_pid = ((payload[2] & 0x1F) << 8) | payload[3]
+            out.append({"type_id": 9, "type_name": "cas", "caid": caid, "pid": ca_pid})
+        elif tag == 0x0A and length >= 3:  # ISO 639 language
+            lang = payload[:3].decode("ascii", errors="replace")
+            out.append({"type_id": 10, "type_name": "lang", "lang": lang})
+        elif tag == 0x40:  # Network Name
+            out.append({"type_id": 64, "type_name": "network_name", "network_name": _decode_dvb_text(payload)})
+        elif tag == 0x48 and length >= 3:  # Service descriptor
+            stype = payload[0]
+            prov_len = payload[1]
+            if 2 + prov_len < length:
+                prov = _decode_dvb_text(payload[2:2 + prov_len])
+                name_len = payload[2 + prov_len]
+                name = _decode_dvb_text(payload[3 + prov_len:3 + prov_len + name_len])
+                out.append({
+                    "type_id": 72,
+                    "type_name": "service",
+                    "service_type": stype,
+                    "service_provider": prov,
+                    "service_name": name,
+                })
+        elif tag == 0x56 and length >= 3:  # Teletext
+            lang = payload[:3].decode("ascii", errors="replace")
+            out.append({"type_id": 86, "type_name": "teletext", "lang": lang})
+        elif tag == 0x59 and length >= 3:  # Subtitling
+            lang = payload[:3].decode("ascii", errors="replace")
+            out.append({"type_id": 89, "type_name": "subtitling", "lang": lang})
+        elif tag == 0x6A:  # AC-3
+            out.append({"type_id": 106, "type_name": "ac3"})
+        else:
+            out.append({"type_id": tag, "type_name": "unknown", "data": payload.hex()})
+    return out
 
 
 def strip_rtp(data: bytes) -> bytes:
@@ -195,15 +323,17 @@ class Segment:
 
 
 class Engine:
-    def __init__(self, urls=(), outputs=None, *, queue_size=256,
-                 segment_duration=2.0, max_segments=6,
-                 max_segment_bytes=8 * 1024 * 1024,
-                 max_hls_bytes=32 * 1024 * 1024, retry_delay=0.5,
-                 udp_timeout=10.0, clock: Callable[[], float] = time.monotonic):
+    def __init__(self, urls=(), outputs=None, *, queue_size=1024,
+                 segment_duration=2.0, max_segments=5,
+                 max_segment_bytes=2 * 1024 * 1024,
+                 max_hls_bytes=6 * 1024 * 1024, retry_delay=0.5,
+                 udp_timeout=10.0, stream_options=None,
+                 clock: Callable[[], float] = time.monotonic):
         if isinstance(urls, str):
             urls = [urls]
         self.urls = list(urls)
         self.outputs = list(outputs or [])
+        self.stream_options = dict(stream_options or {})
         if queue_size < 1 or segment_duration <= 0 or max_segments < 1:
             raise ValueError("queue_size, segment_duration and max_segments must be positive")
         if max_segment_bytes < 188 or max_hls_bytes < max_segment_bytes:
@@ -229,21 +359,31 @@ class Engine:
         self._lifecycle_lock = asyncio.Lock()
         self._counts = dict(packets=0, bytes=0, discarded_bytes=0, sync_losses=0,
                             malformed=0, transport_errors=0, continuity_errors=0,
+                            pes_errors=0, scrambled_packets=0,
                             duplicates=0, null_packets=0, queue_drops=0,
                             output_drops=0, output_errors=0, input_errors=0,
                             retries=0, rtp_errors=0, discontinuities=0)
         self._last_error = None
-        self._pids = {}
+        self._pids = OrderedDict()
         self._pcr_pid = None
         self._pcr_last = None
         self._pcr_index = None
         self._timeline = 0.0
         self._pcr_bitrate = None
-        self._psi = {0: _PSI()}
+        self._psi = {0: _PSI(), 0x10: _PSI(), 0x11: _PSI()}
         self._tables = OrderedDict()
         self._pat_identity = None
         self._pat_sections = {}
         self._pmt_pids = set()
+        self._elementary_pids = {}  # pid -> type_name ("VIDEO", "AUDIO", ...)
+        self._parsed_pat = None
+        self._parsed_pmts = {}
+        self._parsed_sdt = None
+        self._parsed_nit = None
+        self._preroll = bytearray()
+        self._active_input_id = 1
+        self._active_url_opts = {}
+        self._filter_keep_pids = None
         self._segments = OrderedDict()
         self._segment_bytes = 0
         self._sequence = 0
@@ -253,6 +393,22 @@ class Engine:
         self._current_pcr = None
         self._current_discontinuity = False
         self._playlist_target = max(1, math.ceil(segment_duration))
+        self._apply_filter_options({})
+
+    def _apply_filter_options(self, url_opts: dict):
+        self._active_url_opts = dict(url_opts)
+        keep = set()
+        raw_filter = url_opts.get("filter") or self.stream_options.get("filter~") or self.stream_options.get("filter")
+        if isinstance(raw_filter, str) and raw_filter.strip():
+            for part in raw_filter.replace(";", ",").split(","):
+                part = part.strip()
+                if part.isdigit():
+                    keep.add(int(part))
+        if keep:
+            keep.update({0, 0x10, 0x11})
+            self._filter_keep_pids = keep
+        else:
+            self._filter_keep_pids = None
 
     def subscribe(self, max_queue=None):
         size = self.queue_size if max_queue is None else max_queue
@@ -325,6 +481,7 @@ class Engine:
             self._close_queue(queue)
         self._subscribers.clear()
         self._buffer.clear()
+        self._preroll.clear()
         self._locked = False
 
     async def __aenter__(self):
@@ -336,11 +493,32 @@ class Engine:
     def feed(self, data: bytes):
         """Accept arbitrary TS byte chunks; return the number of framed packets.
 
-        A single plausible packet is accepted immediately; when searching within
-        a larger chunk, the next available packet sync is also checked.
+        Uses a zero-copy fast path when already locked and buffer is empty.
         """
-        if self._closed:
+        if self._closed or not data:
             return 0
+        # Fast path: buffer is empty, already locked, and data starts with valid 0x47 packets
+        if not self._buffer and self._locked and len(data) >= 188 and _valid_header(data, 0):
+            mv = memoryview(data)
+            pos = 0
+            packets = 0
+            limit = len(data) - 188
+            while pos <= limit:
+                if not _valid_header(data, pos):
+                    self._counts["sync_losses"] += 1
+                    self._locked = False
+                    break
+                packet = bytes(mv[pos:pos + 188])
+                pos += 188
+                packets += 1
+                self._packet(packet)
+            if pos == len(data):
+                return packets
+            if self._locked:
+                self._buffer.extend(mv[pos:])
+                return packets
+            data = bytes(mv[pos:])
+
         self._buffer.extend(data)
         buf = self._buffer
         pos = 0
@@ -364,20 +542,33 @@ class Engine:
             packets += 1
             self._packet(packet)
         if pos:
-            del buf[:pos]
+            if pos == len(buf):
+                buf.clear()
+            else:
+                del buf[:pos]
         return packets
 
     def _packet(self, packet):
         self._counts["packets"] += 1
         self._counts["bytes"] += 188
         pid = ((packet[1] & 31) << 8) | packet[2]
+        if self._active_url_opts.get("no_eit") and pid == 0x12:
+            return
+        if self._active_url_opts.get("no_sdt") and pid == 0x11:
+            return
+        if self._filter_keep_pids is not None and pid not in self._filter_keep_pids and pid not in self._pmt_pids:
+            return
         afc = (packet[3] >> 4) & 3
         cc = packet[3] & 15
         payload = bool(afc & 1)
+        pusi = bool(packet[1] & 64)
         tei = bool(packet[1] & 128)
         scrambled = bool(packet[3] & 192)
+        if scrambled:
+            self._counts["scrambled_packets"] += 1
         offset = 4
         discontinuity = False
+        random_access = False
         pcr = None
         if afc & 2:
             length = packet[4]
@@ -385,6 +576,7 @@ class Engine:
             if length:
                 flags = packet[5]
                 discontinuity = bool(flags & 128)
+                random_access = bool(flags & 64)
                 if flags & 16:
                     value = packet[6:12]
                     base = (value[0] << 25 | value[1] << 17 | value[2] << 9 |
@@ -399,9 +591,15 @@ class Engine:
         if pid == 0x1FFF:
             self._counts["null_packets"] += 1
         else:
-            state = self._pids.setdefault(pid, dict(cc=None, packet=None, packets=0,
-                                                   continuity_errors=0))
+            state = self._pids.get(pid)
+            if state is None:
+                if len(self._pids) >= MAX_TRACKED_PIDS:
+                    self._pids.popitem(last=False)
+                state = dict(cc=None, packet=None, packets=0, continuity_errors=0,
+                             pes_errors=0, scrambled=False)
+                self._pids[pid] = state
             state["packets"] += 1
+            state["scrambled"] = scrambled
             if tei:
                 self._counts["transport_errors"] += 1
                 state["cc"] = None
@@ -421,13 +619,33 @@ class Engine:
                 state["cc"] = cc
                 if payload:
                     state["packet"] = packet
+                    # Check PES header start code on known elementary video/audio PIDs
+                    if pusi and not scrambled and offset + 4 <= 188:
+                        if pid in self._elementary_pids and self._elementary_pids[pid] in ("VIDEO", "AUDIO"):
+                            if packet[offset:offset + 3] != b"\x00\x00\x01":
+                                self._counts["pes_errors"] += 1
+                                state["pes_errors"] += 1
+                        elif pid > 0x1F and pid not in self._pmt_pids and packet[offset:offset + 3] == b"\x00\x00\x01":
+                            stream_id = packet[offset + 3]
+                            if 0xE0 <= stream_id <= 0xEF:
+                                self._elementary_pids.setdefault(pid, "VIDEO")
+                            elif 0xC0 <= stream_id <= 0xDF or stream_id == 0xBD:
+                                self._elementary_pids.setdefault(pid, "AUDIO")
+
         if (broken or discontinuity) and pid in self._psi:
             self._psi[pid].reset()
         if not tei and not scrambled and not duplicate and payload and pid in self._psi:
-            for section, packets in self._psi[pid].push(packet[offset:], bool(packet[1] & 64), packet):
+            for section, packets in self._psi[pid].push(packet[offset:], pusi, packet):
                 self._cache_table(pid, section, packets)
         if pid != 0x1FFF and not tei and not duplicate:
             self._observe_pcr(pid, pcr, discontinuity)
+            # Update bounded pre-roll buffer for instant VLC .ts startup
+            if random_access and self._elementary_pids.get(pid) == "VIDEO":
+                self._preroll.clear()
+            self._preroll.extend(packet)
+            if len(self._preroll) > PREROLL_MAX_BYTES:
+                excess = ((len(self._preroll) - PREROLL_MAX_BYTES + 187) // 188) * 188
+                del self._preroll[:excess]
         self._hls_packet(packet)
         for queue in self._subscribers:
             self._enqueue(queue, packet, "queue_drops")
@@ -466,14 +684,10 @@ class Engine:
     def _cache_table(self, pid, section, packets):
         if len(section) < 12 or not section[1] & 128 or not section[5] & 1:
             return
-        crc = 0xFFFFFFFF
-        for value in section:
-            crc ^= value << 24
-            for _ in range(8):
-                crc = ((crc << 1) ^ (0x04C11DB7 if crc & 0x80000000 else 0)) & 0xFFFFFFFF
-        if crc:
+        if crc32_mpeg(section):
             return
-        if pid == 0 and section[0] == 0:
+        table_id = section[0]
+        if pid == 0 and table_id == 0:
             if (len(section) - 12) % 4:
                 return
             identity = (section[3:6], section[7])
@@ -483,29 +697,147 @@ class Engine:
                 for key in list(self._tables):
                     if key[0] == 0:
                         del self._tables[key]
+            tsid = int.from_bytes(section[3:5], "big")
             pids = set()
+            programs = []
+            target_pnr = self._active_url_opts.get("pnr")
+            target_pnr = int(target_pnr) if str(target_pnr).isdigit() else None
             for index in range(8, len(section) - 4, 4):
                 program = int.from_bytes(section[index:index + 2], "big")
+                pmt_pid = ((section[index + 2] & 31) << 8) | section[index + 3]
                 if program:
-                    pids.add(((section[index + 2] & 31) << 8) | section[index + 3])
+                    if target_pnr is None or program == target_pnr:
+                        pids.add(pmt_pid)
+                    programs.append({"pnr": program, "pid": pmt_pid})
+            self._parsed_pat = {"psi": "pat", "tsid": tsid, "programs": programs}
             if section[6] >= 32:
                 return
             self._pat_sections[section[6]] = pids
             self._pmt_pids = set(sorted(set().union(*self._pat_sections.values()))[:32])
             self._psi = {key: value for key, value in self._psi.items()
-                         if key == 0 or key in self._pmt_pids}
+                         if key in (0, 0x10, 0x11) or key in self._pmt_pids}
             for pmt in self._pmt_pids:
                 self._psi.setdefault(pmt, _PSI())
             for key in list(self._tables):
                 if key[0] and key[0] not in self._pmt_pids:
                     del self._tables[key]
-        elif pid not in self._pmt_pids or section[0] != 2 or len(section) < 16:
+        elif pid == 0x11 and table_id == 0x42 and len(section) >= 15:
+            # Parse DVB SDT (Service Description Table)
+            tsid = int.from_bytes(section[3:5], "big")
+            onid = int.from_bytes(section[8:10], "big")
+            pos = 11
+            end = len(section) - 4
+            services = []
+            while pos + 5 <= end:
+                sid = int.from_bytes(section[pos:pos + 2], "big")
+                ca_mode = bool((section[pos + 3] >> 4) & 1)
+                dlen = ((section[pos + 3] & 0x0F) << 8) | section[pos + 4]
+                pos += 5
+                if pos + dlen > end:
+                    break
+                descs = _parse_descriptors(section[pos:pos + dlen])
+                pos += dlen
+                services.append({"sid": sid, "ca": ca_mode, "descriptors": descs})
+            self._parsed_sdt = {"psi": "sdt", "tsid": tsid, "onid": onid, "services": services}
+            return
+        elif pid == 0x10 and table_id == 0x40 and len(section) >= 16:
+            # Parse DVB NIT (Network Information Table)
+            net_id = int.from_bytes(section[3:5], "big")
+            nd_len = ((section[8] & 0x0F) << 8) | section[9]
+            pos = 10
+            end = len(section) - 4
+            if pos + nd_len + 2 <= end:
+                net_descs = _parse_descriptors(section[pos:pos + nd_len])
+                pos += nd_len
+                ts_loop_len = ((section[pos] & 0x0F) << 8) | section[pos + 1]
+                pos += 2
+                ts_end = min(end, pos + ts_loop_len)
+                streams = []
+                while pos + 6 <= ts_end:
+                    s_tsid = int.from_bytes(section[pos:pos + 2], "big")
+                    s_onid = int.from_bytes(section[pos + 2:pos + 4], "big")
+                    td_len = ((section[pos + 4] & 0x0F) << 8) | section[pos + 5]
+                    pos += 6
+                    if pos + td_len > ts_end:
+                        break
+                    s_descs = _parse_descriptors(section[pos:pos + td_len])
+                    pos += td_len
+                    streams.append({"tsid": s_tsid, "onid": s_onid, "descriptors": s_descs})
+                self._parsed_nit = {"psi": "nit", "network_id": net_id, "descriptors": net_descs, "streams": streams}
+            return
+        elif pid in self._pmt_pids and table_id == 2 and len(section) >= 16:
+            # Parse MPEG-TS PMT (Program Map Table)
+            pnr = int.from_bytes(section[3:5], "big")
+            pcr_pid = ((section[8] & 0x1F) << 8) | section[9]
+            if pcr_pid != 0x1FFF and self._pcr_pid is None:
+                self._pcr_pid = pcr_pid
+            prog_info_len = ((section[10] & 0x0F) << 8) | section[11]
+            pos = 12
+            end = len(section) - 4
+            prog_descs = []
+            if pos + prog_info_len <= end:
+                prog_descs = _parse_descriptors(section[pos:pos + prog_info_len])
+                pos += prog_info_len
+            es_list = []
+            while pos + 5 <= end:
+                stype = section[pos]
+                epid = ((section[pos + 1] & 0x1F) << 8) | section[pos + 2]
+                es_info_len = ((section[pos + 3] & 0x0F) << 8) | section[pos + 4]
+                pos += 5
+                if pos + es_info_len > end:
+                    break
+                es_descs = _parse_descriptors(section[pos:pos + es_info_len])
+                pos += es_info_len
+                tname = STREAM_TYPE_CATEGORIES.get(stype, "DATA")
+                if stype == 0x06:
+                    for d in es_descs:
+                        if d.get("type_id") == 106:
+                            tname = "AUDIO"
+                        elif d.get("type_id") == 89:
+                            tname = "SUB"
+                        elif d.get("type_id") == 86:
+                            tname = "TTX"
+                self._elementary_pids[epid] = tname
+                es_list.append({
+                    "pid": epid,
+                    "type_id": stype,
+                    "type_name": tname,
+                    "descriptors": es_descs,
+                })
+            self._parsed_pmts[pnr] = {
+                "psi": "pmt",
+                "pnr": pnr,
+                "pid": pid,
+                "pcr": pcr_pid,
+                "descriptors": prog_descs,
+                "streams": es_list,
+            }
+        else:
             return
         key = (pid, section[6])
         self._tables[key] = packets
         self._tables.move_to_end(key)
         while len(self._tables) > 64:
             self._tables.popitem(last=False)
+
+    def _synth_psi_prefix(self) -> bytes:
+        """Synthesize compliant PAT + PMT packets if upstream stream omitted PSI tables."""
+        if not self._elementary_pids:
+            return b""
+        pat_body = b"\x00\x01\xc1\x00\x00\x00\x01\xf0\x00"  # TSID=1, PNR=1 -> PMT PID 0x1000 (4096)
+        pat_pkt = build_psi_packet(0, 0x00, pat_body, cc=0)
+        pcr_pid = self._pcr_pid or next(iter(self._elementary_pids), 0x1FFF)
+        es_bytes = bytearray()
+        for epid, tname in sorted(self._elementary_pids.items())[:16]:
+            stype = 0x1B if tname == "VIDEO" else (0x0F if tname == "AUDIO" else 0x06)
+            es_bytes += bytes([stype, 0xE0 | ((epid >> 8) & 0x1F), epid & 0xFF, 0xF0, 0x00])
+        pmt_body = (
+            b"\x00\x01\xc1\x00\x00"
+            + bytes([0xE0 | ((pcr_pid >> 8) & 0x1F), pcr_pid & 0xFF, 0xF0, 0x00])
+            + bytes(es_bytes)
+        )
+        pmt_pkt = build_psi_packet(0x1000, 0x02, pmt_body, cc=0)
+        return pat_pkt + pmt_pkt
 
     def _prefix(self):
         packets = []
@@ -515,7 +847,54 @@ class Engine:
                 if packet not in seen:
                     packets.append(packet)
                     seen.add(packet)
-        return b"".join(packets)
+        if packets:
+            return b"".join(packets)
+        return self._synth_psi_prefix()
+
+    def bootstrap_burst(self) -> bytes:
+        """Return PAT + PMT prefix followed by recent aligned TS packets for instant VLC playback."""
+        prefix = self._prefix()
+        preroll = bytes(self._preroll)
+        if not prefix and not preroll:
+            return b""
+        return prefix + preroll
+
+    def psi_summary(self) -> dict:
+        """Return full Cesbo Astra Analyzer PSI/SI tables and stream metrics."""
+        st = self.stats()
+        pat_data = self._parsed_pat
+        pmt_list = list(self._parsed_pmts.values())
+        if not pat_data and self._elementary_pids:
+            pat_data = {"psi": "pat", "tsid": 1, "programs": [{"pnr": 1, "pid": 4096}]}
+            pcr_pid = self._pcr_pid or next(iter(self._elementary_pids), 8191)
+            pmt_list = [{
+                "psi": "pmt",
+                "pnr": 1,
+                "pid": 4096,
+                "pcr": pcr_pid,
+                "descriptors": [],
+                "streams": [
+                    {
+                        "pid": epid,
+                        "type_id": 27 if tname == "VIDEO" else 15,
+                        "type_name": tname,
+                        "descriptors": [],
+                    }
+                    for epid, tname in sorted(self._elementary_pids.items())
+                ],
+            }]
+        return {
+            "pat": pat_data,
+            "pmt": pmt_list,
+            "sdt": self._parsed_sdt,
+            "nit": self._parsed_nit,
+            "total": {
+                "bitrate": int(round(st["bitrate"] / 1000.0)),
+                "cc_errors": st["continuity_errors"],
+                "pes_errors": st["pes_errors"],
+                "scrambled": st["scrambled"],
+            },
+        }
 
     def _elapsed_segment(self):
         if self._current_pcr is not None and self._timeline > self._current_pcr:
@@ -557,6 +936,22 @@ class Engine:
             self._segment_bytes -= len(old.data)
             self._evicted_discontinuities += int(old.discontinuity)
 
+    async def wait_for_hls(self, timeout: float = 3.0) -> bool:
+        """Wait briefly for the first HLS segment or flush an initial segment if ready."""
+        if self._segments:
+            return True
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and self._running:
+            if self._segments:
+                return True
+            if len(self._current) >= 188 * 48 and self._elapsed_segment() >= 0.5:
+                self._finish_segment()
+                return True
+            await asyncio.sleep(0.05)
+        if not self._segments and len(self._current) >= 188 * 16:
+            self._finish_segment()
+        return bool(self._segments)
+
     def hls_playlist(self):
         """Return an M3U8 string with relative segment-<sequence>.ts URIs."""
         first = next(iter(self._segments), self._sequence)
@@ -579,8 +974,16 @@ class Engine:
 
     def stats(self):
         elapsed = max(0.0, self._clock() - self._created)
-        return {**self._counts, "running": self._running, "elapsed": elapsed,
-                "bitrate": self._counts["bytes"] * 8 / elapsed if elapsed else 0.0,
+        avg_bitrate = self._counts["bytes"] * 8 / elapsed if elapsed else 0.0
+        effective_bitrate = self._pcr_bitrate if (self._pcr_bitrate and self._pcr_bitrate > 0 and elapsed > 2.0) else avg_bitrate
+        any_scrambled = any(s.get("scrambled") for s in self._pids.values())
+        return {**self._counts,
+                "cc_errors": self._counts["continuity_errors"],
+                "scrambled": any_scrambled,
+                "input_id": self._active_input_id,
+                "running": self._running, "elapsed": elapsed,
+                "bitrate": avg_bitrate,
+                "effective_bitrate": effective_bitrate,
                 "pcr_bitrate": self._pcr_bitrate, "pcr_pid": self._pcr_pid,
                 "pcr": self._pcr_last, "subscribers": len(self._subscribers),
                 "hls_segments": len(self._segments),
@@ -591,11 +994,15 @@ class Engine:
 
     async def _run_inputs(self):
         while self._running:
-            for url in self.urls:
+            for idx, url in enumerate(self.urls, start=1):
                 if not self._running:
                     return
+                self._active_input_id = idx
+                url_opts = parse_astra_url_options(url)
+                self._apply_filter_options(url_opts)
                 # A failed source cannot leave half a packet/section for its successor.
                 self._buffer.clear()
+                self._preroll.clear()
                 self._locked = False
                 for state in self._pids.values():
                     state["cc"] = None
@@ -609,13 +1016,14 @@ class Engine:
                     self._pat_sections.clear()
                     self._pat_identity = None
                     self._pmt_pids.clear()
-                    self._psi = {0: _PSI()}
+                    self._elementary_pids.clear()
+                    self._psi = {0: _PSI(), 0x10: _PSI(), 0x11: _PSI()}
                 try:
                     scheme = urlsplit(url).scheme.lower()
                     if scheme in ("http", "https"):
-                        await self._http_input(url)
+                        await self._http_input(url, url_opts)
                     elif scheme in ("udp", "rtp"):
-                        await self._udp_input(url, scheme == "rtp")
+                        await self._udp_input(url, scheme == "rtp", url_opts)
                     else:
                         raise ValueError(f"unsupported input scheme: {scheme}")
                 except asyncio.CancelledError:
@@ -626,58 +1034,97 @@ class Engine:
                 self._counts["retries"] += 1
                 await asyncio.sleep(self.retry_delay)
 
-    async def _http_input(self, url):
-        import httpx
-        from urllib.parse import urljoin
-        clean_url = url.split("#", 1)[0]
-        timeout = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
-        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
-            if clean_url.lower().split("?", 1)[0].endswith((".m3u8", ".m3u")):
-                seen_segments = OrderedDict()
-                playlist_url = clean_url
-                while self._running:
-                    resp = await client.get(playlist_url)
-                    resp.raise_for_status()
-                    text = resp.text
-                    lines = [line.strip() for line in text.splitlines() if line.strip()]
-                    if any(line.startswith("#EXT-X-STREAM-INF") for line in lines):
-                        for i, line in enumerate(lines):
-                            if line.startswith("#EXT-X-STREAM-INF") and i + 1 < len(lines):
-                                nxt = lines[i + 1]
-                                if not nxt.startswith("#"):
-                                    playlist_url = urljoin(str(resp.url), nxt)
-                                    break
-                        continue
-                    seg_urls = [urljoin(str(resp.url), line) for line in lines if not line.startswith("#")]
-                    new_segs = [u for u in seg_urls if u not in seen_segments]
-                    for seg_url in new_segs:
+    async def _stream_hls_playlist(self, client, playlist_url: str):
+        seen_segments = OrderedDict()
+        first_load = True
+        while self._running:
+            resp = await client.get(playlist_url)
+            resp.raise_for_status()
+            text = resp.text
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            if any(line.startswith("#EXT-X-STREAM-INF") for line in lines):
+                for i, line in enumerate(lines):
+                    if line.startswith("#EXT-X-STREAM-INF") and i + 1 < len(lines):
+                        nxt = lines[i + 1]
+                        if not nxt.startswith("#"):
+                            playlist_url = urljoin(str(resp.url), nxt)
+                            break
+                continue
+            seg_urls = [urljoin(str(resp.url), line) for line in lines if not line.startswith("#")]
+            if first_load and len(seg_urls) > 2:
+                # Start at live edge (last 2 segments) to avoid dumping old segments into RAM
+                for old_url in seg_urls[:-2]:
+                    seen_segments[old_url] = True
+            first_load = False
+            new_segs = [u for u in seg_urls if u not in seen_segments]
+            for seg_url in new_segs:
+                if not self._running:
+                    return
+                seen_segments[seg_url] = True
+                while len(seen_segments) > 120:
+                    seen_segments.popitem(last=False)
+                async with client.stream("GET", seg_url) as seg_resp:
+                    seg_resp.raise_for_status()
+                    async for chunk in seg_resp.aiter_bytes(chunk_size=188 * 64):
                         if not self._running:
                             return
-                        seen_segments[seg_url] = True
-                        while len(seen_segments) > 200:
-                            seen_segments.popitem(last=False)
-                        seg_resp = await client.get(seg_url)
-                        seg_resp.raise_for_status()
-                        self.feed(seg_resp.content)
-                    await asyncio.sleep(1.0 if new_segs else 1.5)
+                        self.feed(chunk)
+                        # Yield to event loop so HTTP .ts / UDP subscribers drain without queue drops
+                        await asyncio.sleep(0)
+            await asyncio.sleep(0.6 if new_segs else 1.0)
+
+    async def _http_input(self, url, url_opts=None):
+        import httpx
+        url_opts = url_opts or {}
+        clean_url = url.split("#", 1)[0]
+        conn_timeout = float(url_opts.get("timeout", 10.0)) if str(url_opts.get("timeout", "")).replace(".", "").isdigit() else 10.0
+        ua = url_opts.get("ua") or "AstraG/2.0"
+        timeout = httpx.Timeout(connect=conn_timeout, read=25.0, write=10.0, pool=10.0)
+        limits = httpx.Limits(max_keepalive_connections=4, max_connections=8)
+        headers = {"User-Agent": ua, "Accept": "*/*", "Icy-MetaData": "0"}
+        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, limits=limits, headers=headers) as client:
+            if clean_url.lower().split("?", 1)[0].endswith((".m3u8", ".m3u")):
+                await self._stream_hls_playlist(client, clean_url)
                 return
+            switch_to_hls = False
             async with client.stream("GET", clean_url) as response:
                 response.raise_for_status()
-                async for chunk in response.aiter_bytes():
-                    self.feed(chunk)
+                ctype = response.headers.get("content-type", "").lower()
+                if "mpegurl" in ctype or "m3u" in ctype:
+                    switch_to_hls = True
+                else:
+                    first_chunk = True
+                    async for chunk in response.aiter_bytes(chunk_size=188 * 64):
+                        if not self._running:
+                            return
+                        if first_chunk:
+                            first_chunk = False
+                            stripped = chunk.lstrip()
+                            if stripped.startswith(b"#EXTM3U"):
+                                switch_to_hls = True
+                                break
+                        self.feed(chunk)
+                        await asyncio.sleep(0)
+            if switch_to_hls and self._running:
+                await self._stream_hls_playlist(client, clean_url)
 
     @staticmethod
     def _udp_address(url):
-        parsed = urlsplit(url)
+        clean = url.split("#", 1)[0]
+        opts = parse_astra_url_options(url)
+        parsed = urlsplit(clean)
         if parsed.username not in (None, "") or parsed.password is not None:
             raise ValueError("UDP URLs do not support credentials")
         host = parsed.hostname or "0.0.0.0"
         port = parsed.port
         if port is None or not 1 <= port <= 65535:
             raise ValueError("UDP URL requires a valid port")
-        return host, port, parse_qs(parsed.query)
+        q = parse_qs(parsed.query)
+        if "localaddr" in opts and "interface" not in q:
+            q["interface"] = [opts["localaddr"]]
+        return host, port, q
 
-    async def _udp_input(self, url, rtp=False):
+    async def _udp_input(self, url, rtp=False, url_opts=None):
         host, port, query = self._udp_address(url)
         group = ipaddress.IPv4Address(host)
         interface = str(ipaddress.IPv4Address(query.get("interface", ["0.0.0.0"])[0]))
@@ -685,6 +1132,10 @@ class Engine:
         membership = None
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2 * 1024 * 1024)
+            except (OSError, AttributeError):
+                pass
             sock.setblocking(False)
             if group.is_multicast:
                 sock.bind(("0.0.0.0", port))
@@ -739,7 +1190,20 @@ class Engine:
             try:
                 if packet is END_OF_STREAM:
                     return
-                await loop.sock_sendto(sock, packet, address)
+                # Coalesce up to 7 TS packets (1316 bytes <= 1500 MTU) when already queued
+                if not queue.empty() and len(packet) == 188:
+                    batch = bytearray(packet)
+                    while len(batch) + 188 <= 1316 and not queue.empty():
+                        nxt = queue.get_nowait()
+                        if nxt is END_OF_STREAM:
+                            await loop.sock_sendto(sock, bytes(batch), address)
+                            queue.task_done()
+                            return
+                        batch.extend(nxt)
+                        queue.task_done()
+                    await loop.sock_sendto(sock, bytes(batch), address)
+                else:
+                    await loop.sock_sendto(sock, packet, address)
             except OSError as exc:
                 self._counts["output_errors"] += 1
                 self._last_error = f"{type(exc).__name__}: {exc}"

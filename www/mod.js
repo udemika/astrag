@@ -1,7 +1,29 @@
-/* Astra Control Panel: Settings -> Users, Full Login & IPTV Extensions */
+/* AstraG Control Panel: Branding, Settings -> Users, Full Login & IPTV Extensions */
 ;(function () {
     'use strict'
     if (!window.$ || !window.app) return
+
+    // Rebrand Control Panel title to AstraG Control Panel
+    document.title = 'AstraG Control Panel'
+    app.setTitle = function (value) {
+        var b = 'AstraG Control Panel'
+        document.title = !!value ? value + ' - ' + b : b
+    }
+
+    // Clean up version footer text ("Astra AstraG 2.0" -> "AstraG 2.0")
+    var fixVersionBadge = function () {
+        var badges = document.querySelectorAll('.version.monospace')
+        for (var i = 0; i < badges.length; i++) {
+            var txt = badges[i].textContent || ''
+            if (txt.indexOf('Astra AstraG') === 0) {
+                badges[i].textContent = txt.replace(/^Astra\s+/, '')
+            }
+        }
+    }
+    if (window.MutationObserver) {
+        var obs = new MutationObserver(fixVersionBadge)
+        obs.observe(document.body, { childList: true, subtree: true })
+    }
 
     // Restore session auth token into cookie before DOMContentLoaded $(function(){...}) runs
     try {

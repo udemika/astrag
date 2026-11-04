@@ -15,6 +15,7 @@ import logging
 import os
 from pathlib import Path
 import signal
+import sys
 import tempfile
 import time
 import uuid
@@ -28,10 +29,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from account_security import FailedAuthLimiter, hash_password, valid_login, valid_password, verify_password
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError
 
 logger = logging.getLogger("astrag.backend")
-APP_DIR = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+    APP_DIR = Path(sys.executable).resolve().parent
+else:
+    BUNDLE_DIR = Path(__file__).resolve().parent
+    APP_DIR = BUNDLE_DIR
 
 
 def _default_config_file() -> Path:
@@ -75,7 +81,10 @@ HOST = os.environ.get("ASTRA_HOST", OPTIONS.get("ASTRA_HOST", OPTIONS.get("HOST"
 PORT = int(os.environ.get("ASTRA_PORT", os.environ.get("PORT", OPTIONS.get("ASTRA_PORT", OPTIONS.get("PORT", "3000")))))
 STATIC_DIR = Path(os.environ.get("ASTRA_STATIC_DIR", OPTIONS.get("ASTRA_STATIC_DIR", OPTIONS.get("STATIC_DIR", str(APP_DIR / "www")))))
 if not STATIC_DIR.is_dir() and "ASTRA_STATIC_DIR" not in os.environ:
-    STATIC_DIR = APP_DIR / "www"
+    for _cand in (APP_DIR / "www", BUNDLE_DIR / "www", Path("/opt/astrag/www")):
+        if _cand.is_dir():
+            STATIC_DIR = _cand
+            break
 
 
 def validate_url(value, output=False):
@@ -103,24 +112,39 @@ def validate_url(value, output=False):
     return value
 
 
+def validate_stream_entry(item: dict) -> dict:
+    """Strict stream configuration validator compatible with both Pydantic v1 and v2 (Ubuntu APT)."""
+    if not isinstance(item, dict):
+        raise ValueError("each stream entry must be an object")
+    entry = dict(item)
+    sid = entry.get("id", "")
+    name = entry.get("name", "")
+    stype = entry.get("type", "spts")
+    enable = entry.get("enable", True)
+    raw_in = entry.get("input", [])
+    raw_out = entry.get("output", [])
+    if not isinstance(sid, str) or not isinstance(name, str) or not isinstance(stype, str):
+        raise ValueError("stream id, name, and type must be strings")
+    if not isinstance(enable, bool):
+        raise ValueError("stream enable must be a boolean")
+    if not isinstance(raw_in, list) or not isinstance(raw_out, list):
+        raise ValueError("stream input and output must be lists")
+    entry["id"] = sid
+    entry["name"] = name
+    entry["type"] = stype
+    entry["enable"] = enable
+    entry["input"] = [validate_url(v, False) for v in raw_in if not (isinstance(v, str) and not v.strip())]
+    entry["output"] = [validate_url(v, True) for v in raw_out if not (isinstance(v, str) and not v.strip())]
+    return entry
+
+
 class StreamConfig(BaseModel):
-    model_config = ConfigDict(extra="allow", strict=True)
     id: str = ""
     name: str = ""
     type: str = "spts"
     input: List[str] = Field(default_factory=list)
     output: List[str] = Field(default_factory=list)
     enable: bool = True
-
-    @field_validator("input")
-    @classmethod
-    def inputs(cls, values):
-        return [validate_url(v) for v in values if not (isinstance(v, str) and not v.strip())]
-
-    @field_validator("output")
-    @classmethod
-    def outputs(cls, values):
-        return [validate_url(v, True) for v in values if not (isinstance(v, str) and not v.strip())]
 
 
 async def maybe_await(value):
@@ -188,7 +212,7 @@ def validate_config(config):
     try:
         streams = []
         for item in result["make_stream"]:
-            entry = StreamConfig.model_validate(item).model_dump()
+            entry = validate_stream_entry(item)
             if not entry["id"] or entry["id"] in seen:
                 raise ValueError("stream IDs must be nonempty and unique")
             seen.add(entry["id"])
@@ -466,10 +490,11 @@ class ServerState:
 
 async def publish_stats():
     tick = 0
+    prev_errors = {}
     while True:
         await asyncio.sleep(1)
         tick += 1
-        if tick % 15 == 0:
+        if tick % 60 == 0:
             try:
                 from stream_engine import trim_process_memory
                 trim_process_memory()
@@ -477,6 +502,10 @@ async def publish_stats():
                 pass
         if not state.websocket_clients:
             continue
+        active_sids = set(state.engines)
+        for dead_sid in list(prev_errors):
+            if dead_sid not in active_sids:
+                prev_errors.pop(dead_sid, None)
         for sid, engine in list(state.engines.items()):
             try:
                 stats = getattr(engine, "stats", {})
@@ -488,8 +517,12 @@ async def publish_stats():
                 raw_br = stats.get("effective_bitrate", stats.get("bitrate", 0)) or 0
                 stats["bitrate"] = int(round(raw_br / 1000))
                 stats["onair"] = bool(stats.get("running") and stats["bitrate"] > 0)
-                stats["cc_error"] = stats.get("cc_errors", stats.get("continuity_errors", 0))
-                stats["pes_error"] = stats.get("pes_errors", 0)
+                cur_cc = int(stats.get("cc_errors", stats.get("continuity_errors", 0)) or 0)
+                cur_pes = int(stats.get("pes_errors", 0) or 0)
+                prev_cc, prev_pes = prev_errors.get(sid, (0, 0))
+                prev_errors[sid] = (cur_cc, cur_pes)
+                stats["cc_error"] = cur_cc - prev_cc if cur_cc >= prev_cc else cur_cc
+                stats["pes_error"] = cur_pes - prev_pes if cur_pes >= prev_pes else cur_pes
                 stats["scrambled"] = bool(stats.get("scrambled", False))
                 input_id = int(stats.get("input_id", 1))
                 await state.broadcast("stream_event", {
@@ -688,7 +721,24 @@ async def lifespan(app):
         state.websocket_clients.clear()
 
 
-app = FastAPI(title="AstraG Media Server", version="2.0", lifespan=lifespan)
+if "lifespan" in inspect.signature(FastAPI.__init__).parameters:
+    app = FastAPI(title="AstraG Media Server", version="2.0", lifespan=lifespan)
+else:
+    app = FastAPI(title="AstraG Media Server", version="2.0")
+    _lifespan_ctx = None
+
+    @app.on_event("startup")
+    async def _legacy_startup():
+        global _lifespan_ctx
+        _lifespan_ctx = lifespan(app)
+        await _lifespan_ctx.__aenter__()
+
+    @app.on_event("shutdown")
+    async def _legacy_shutdown():
+        global _lifespan_ctx
+        if _lifespan_ctx is not None:
+            await _lifespan_ctx.__aexit__(None, None, None)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

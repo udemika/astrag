@@ -18,8 +18,9 @@ Environment="ASTRA_PORT=8000"
 Environment="ASTRA_STATIC_DIR=/opt/astrag/www"
 Environment="ASTRA_STATE_FILE=/var/lib/astrag/state.json"
 Environment="ASTRA_CONFIG_FILE=/etc/astrag/astrag.conf"
+Environment="TMPDIR=/run/astrag"
 EnvironmentFile=-/etc/astrag/astrag.conf
-ExecStart=/opt/astrag/venv/bin/python /opt/astrag/astra_clone_backend.py
+ExecStart=/usr/bin/python3 /opt/astrag/astra_clone_backend.py
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5

@@ -15,6 +15,7 @@ systemctl disable astra-clone.service 2>/dev/null || true
 
 pkill -f "astra_clone_backend.py" 2>/dev/null || true
 pkill -f "astrag_backend.py" 2>/dev/null || true
+pkill -f "/opt/astrag/astrag" 2>/dev/null || true
 
 echo "==> Removing systemd units and CLI launchers..."
 rm -f /etc/systemd/system/astrag.service /etc/systemd/system/astra-clone.service

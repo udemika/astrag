@@ -396,6 +396,7 @@ class ServerState:
                     host=HOST,
                     port=p,
                     log_level="warning",
+                    access_log=False,
                     loop="asyncio",
                     lifespan="off",
                 )
@@ -1639,15 +1640,34 @@ if STATIC_DIR.is_dir():
 
 
 def main() -> int:
-    global PORT, HOST
+    global PORT, HOST, CONFIG_FILE
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        libc.prctl(15, b"astrag\x00", 0, 0, 0)
+    except Exception:
+        pass
     parser = argparse.ArgumentParser(description="AstraG media & control server")
+    parser.add_argument("-c", "--config", default=str(CONFIG_FILE), help="Configuration file path (default: %(default)s)")
     parser.add_argument("-p", "--port", type=int, default=PORT, help="Primary HTTP/IPTV port (default: %(default)s)")
     parser.add_argument("--host", default=HOST, help="Bind address (default: %(default)s)")
     args, _ = parser.parse_known_args()
-    PORT = args.port
-    HOST = args.host
+    if args.config:
+        CONFIG_FILE = Path(args.config)
+        opts = read_options()
+        if "-p" not in sys.argv and "--port" not in sys.argv and ("ASTRA_PORT" in opts or "PORT" in opts):
+            PORT = int(opts.get("ASTRA_PORT", opts.get("PORT", PORT)))
+        else:
+            PORT = args.port
+        if "--host" not in sys.argv and ("ASTRA_HOST" in opts or "HOST" in opts):
+            HOST = opts.get("ASTRA_HOST", opts.get("HOST", HOST))
+        else:
+            HOST = args.host
+    else:
+        PORT = args.port
+        HOST = args.host
     import uvicorn
-    uvicorn.run(app, host=HOST, port=PORT, loop="asyncio")
+    uvicorn.run(app, host=HOST, port=PORT, log_level="warning", access_log=False, loop="asyncio")
     return 0
 
 

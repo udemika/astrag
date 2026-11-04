@@ -176,6 +176,12 @@ systemctl daemon-reload
 if "$START"; then
     systemctl enable astrag.service
     systemctl restart astrag.service
+    sleep 1
+    if ! systemctl is-active --quiet astrag.service; then
+        echo "ERROR: astrag.service failed to start. Recent logs:" >&2
+        journalctl -u astrag.service -n 30 --no-pager >&2 || true
+        exit 1
+    fi
     SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || echo '127.0.0.1')"
     echo "================================================================"
     echo " AstraG successfully installed and started!"

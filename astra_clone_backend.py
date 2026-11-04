@@ -1588,7 +1588,8 @@ if STATIC_DIR.is_dir():
     app.mount("/", AstraStaticOrStreamApp(directory=str(STATIC_DIR), html=True), name="static")
 
 
-if __name__ == "__main__":
+def main() -> int:
+    global PORT, HOST
     parser = argparse.ArgumentParser(description="AstraG media & control server")
     parser.add_argument("-p", "--port", type=int, default=PORT, help="Primary HTTP/IPTV port (default: %(default)s)")
     parser.add_argument("--host", default=HOST, help="Bind address (default: %(default)s)")
@@ -1597,3 +1598,9 @@ if __name__ == "__main__":
     HOST = args.host
     import uvicorn
     uvicorn.run(app, host=HOST, port=PORT, loop="asyncio")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

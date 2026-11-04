@@ -155,9 +155,7 @@ chown root:"$SERVICE_USER" "$CONFIG_DIR/astrag.conf"
 chmod 0640 "$CONFIG_DIR/astrag.conf"
 
 SERVICE_SRC="$SCRIPT_DIR/astrag.service"
-if [ ! -f "$SERVICE_SRC" ]; then SERVICE_SRC="$SCRIPT_DIR/astra-clone.service"; fi
 install -o root -g root -m 0644 "$SERVICE_SRC" /etc/systemd/system/astrag.service
-install -o root -g root -m 0644 "$SERVICE_SRC" /etc/systemd/system/astra-clone.service
 
 cat > /usr/bin/astrag <<'EOF'
 #!/bin/sh

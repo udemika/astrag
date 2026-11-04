@@ -133,15 +133,17 @@ def make_engine(config):
     except ImportError as exc:
         raise HTTPException(503, "Native stream engine unavailable") from exc
     hls_cfg = state.config.get("hls", {}) if "state" in globals() else {}
-    seg_dur = float(hls_cfg.get("duration") or 2.0)
-    max_segs = int(hls_cfg.get("quantity") or 4)
+    seg_dur = float(hls_cfg.get("duration") or 3.0)
+    max_segs = int(hls_cfg.get("quantity") or 5)
     seg_dur = max(1.0, min(10.0, seg_dur))
-    max_segs = max(2, min(10, max_segs))
+    max_segs = max(2, min(12, max_segs))
     return Engine(
         config["input"],
         outputs=config.get("output", []),
         segment_duration=seg_dur,
         max_segments=max_segs,
+        max_segment_bytes=5 * 1024 * 1024,
+        max_hls_bytes=16 * 1024 * 1024,
         stream_options=config,
     )
 

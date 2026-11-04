@@ -5,27 +5,27 @@
 ## Screenshots
 
 ### Login Screen (`admin` / `admin`)
-![AstraG Login](docs/screenshots/astrag-login.png)
+![AstraG Login](https://raw.githubusercontent.com/udemika/astrag/main/docs/screenshots/astrag-login.png)
 
 ### Main Dashboard Window
-![AstraG Main Window](docs/screenshots/astrag-main.png)
+![AstraG Main Window](https://raw.githubusercontent.com/udemika/astrag/main/docs/screenshots/astrag-main.png)
 
 ## One-Command Installation on Ubuntu 22.04 / 24.04
 
 ```bash
-rm -rf /tmp/astrag && git clone https://github.com/onlyoktv/astrag.git /tmp/astrag && sudo bash /tmp/astrag/install.sh --start --port 8000 && rm -rf /tmp/astrag
+rm -rf /tmp/astrag && git clone https://github.com/udemika/astrag.git /tmp/astrag && sudo bash /tmp/astrag/install.sh --start --port 8000 && rm -rf /tmp/astrag
 ```
 
 Or directly via `curl`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/onlyoktv/astrag/main/install.sh | sudo bash -s -- --start --port 8000
+curl -fsSL https://raw.githubusercontent.com/udemika/astrag/main/install.sh | sudo bash -s -- --start --port 8000
 ```
 
 ## Complete Uninstall Command
 
 ```bash
-sudo bash install.sh --uninstall
+curl -fsSL https://raw.githubusercontent.com/udemika/astrag/main/uninstall.sh | sudo bash
 ```
 
 | Path | Purpose / Ownership |

@@ -5,7 +5,7 @@ set -euo pipefail
 START=true
 UNINSTALL=false
 CUSTOM_PORT="${ASTRA_PORT:-8000}"
-REPO_URL="${ASTRA_REPO_URL:-https://github.com/onlyoktv/astrag.git}"
+REPO_URL="${ASTRA_REPO_URL:-https://github.com/udemika/astrag.git}"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in

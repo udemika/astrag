@@ -7,10 +7,10 @@
 ## Скриншоты интерфейса AstraG
 
 ### 1. Окно входа в панель управления (`admin` / `admin`)
-![Окно входа AstraG](docs/screenshots/astrag-login.png)
+![Окно входа AstraG](https://raw.githubusercontent.com/udemika/astrag/main/docs/screenshots/astrag-login.png)
 
 ### 2. Основное окно управления потоками (Dashboard)
-![Основное окно AstraG](docs/screenshots/astrag-main.png)
+![Основное окно AstraG](https://raw.githubusercontent.com/udemika/astrag/main/docs/screenshots/astrag-main.png)
 
 ---
 
@@ -19,13 +19,13 @@
 Команда автоматически устанавливает все системные зависимости, клонирует `AstraG` в `/opt/astrag`, настраивает виртуальное окружение Python, создаёт и **сразу запускает** системный сервис `astrag.service` в автозагрузке на порту `8000` (а также открывает порт в `ufw`, если файрвол активен):
 
 ```bash
-rm -rf /tmp/astrag && git clone https://github.com/onlyoktv/astrag.git /tmp/astrag && sudo bash /tmp/astrag/install.sh --start --port 8000 && rm -rf /tmp/astrag
+rm -rf /tmp/astrag && git clone https://github.com/udemika/astrag.git /tmp/astrag && sudo bash /tmp/astrag/install.sh --start --port 8000 && rm -rf /tmp/astrag
 ```
 
-Или напрямую через `curl` (укажите ссылку на ваш репозиторий в `--repo`, если используете форк):
+Или напрямую одной командой через `curl`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/onlyoktv/astrag/main/install.sh | sudo bash -s -- --start --port 8000
+curl -fsSL https://raw.githubusercontent.com/udemika/astrag/main/install.sh | sudo bash -s -- --start --port 8000
 ```
 
 > **После выполнения команды панель сразу доступна по адресу:**
@@ -41,7 +41,13 @@ curl -fsSL https://raw.githubusercontent.com/onlyoktv/astrag/main/install.sh | s
 Если проект уже установлен, обновить движок и перезапустить сервис (с полным сохранением всех потоков и пользователей в `/var/lib/astrag/state.json`) можно одной командой:
 
 ```bash
-rm -rf /tmp/astrag && git clone https://github.com/onlyoktv/astrag.git /tmp/astrag && sudo bash /tmp/astrag/install.sh --update --port 8000 && rm -rf /tmp/astrag
+rm -rf /tmp/astrag && git clone https://github.com/udemika/astrag.git /tmp/astrag && sudo bash /tmp/astrag/install.sh --update --port 8000 && rm -rf /tmp/astrag
+```
+
+Или через `curl`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/udemika/astrag/main/install.sh | sudo bash -s -- --update --port 8000
 ```
 
 ---
@@ -54,7 +60,13 @@ rm -rf /tmp/astrag && git clone https://github.com/onlyoktv/astrag.git /tmp/astr
 sudo systemctl stop astrag astra-clone 2>/dev/null || true && sudo systemctl disable astrag astra-clone 2>/dev/null || true && sudo pkill -f "astra_clone_backend.py|astrag_backend.py" 2>/dev/null || true && sudo rm -f /etc/systemd/system/astrag.service /etc/systemd/system/astra-clone.service /usr/bin/astrag /usr/bin/astra-clone && sudo systemctl daemon-reload && sudo rm -rf /opt/astrag /opt/astra-clone /etc/astrag /etc/astra-clone /var/lib/astrag /var/lib/astra-clone && sudo userdel astrag 2>/dev/null || true && sudo userdel astra-clone 2>/dev/null || true && echo "AstraG полностью удалён"
 ```
 
-Или через встроенный флаг установщика:
+Или через скрипт деинсталляции с GitHub:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/udemika/astrag/main/uninstall.sh | sudo bash
+```
+
+Или локально через встроенный флаг установщика:
 
 ```bash
 sudo bash install.sh --uninstall

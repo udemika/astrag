@@ -10,6 +10,9 @@ Group=astrag
 WorkingDirectory=/opt/astrag
 Environment="PYTHONUNBUFFERED=1"
 Environment="PYTHONDONTWRITEBYTECODE=1"
+Environment="MALLOC_MMAP_THRESHOLD_=131072"
+Environment="MALLOC_TRIM_THRESHOLD_=131072"
+Environment="MALLOC_ARENA_MAX=2"
 Environment="ASTRA_HOST=0.0.0.0"
 Environment="ASTRA_PORT=8000"
 Environment="ASTRA_STATIC_DIR=/opt/astrag/www"

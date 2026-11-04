@@ -161,6 +161,9 @@ install -o root -g root -m 0644 "$SERVICE_SRC" /etc/systemd/system/astra-clone.s
 
 cat > /usr/bin/astrag <<'EOF'
 #!/bin/sh
+export MALLOC_MMAP_THRESHOLD_=131072
+export MALLOC_TRIM_THRESHOLD_=131072
+export MALLOC_ARENA_MAX=2
 exec /opt/astrag/venv/bin/python /opt/astrag/astra_clone_backend.py "$@"
 EOF
 chown root:root /usr/bin/astrag

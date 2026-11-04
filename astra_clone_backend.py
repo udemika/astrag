@@ -133,10 +133,10 @@ def make_engine(config):
     except ImportError as exc:
         raise HTTPException(503, "Native stream engine unavailable") from exc
     hls_cfg = state.config.get("hls", {}) if "state" in globals() else {}
-    seg_dur = float(hls_cfg.get("duration") or 3.0)
-    max_segs = int(hls_cfg.get("quantity") or 6)
-    seg_dur = max(1.0, min(15.0, seg_dur))
-    max_segs = max(2, min(20, max_segs))
+    seg_dur = float(hls_cfg.get("duration") or 2.0)
+    max_segs = int(hls_cfg.get("quantity") or 4)
+    seg_dur = max(1.0, min(10.0, seg_dur))
+    max_segs = max(2, min(10, max_segs))
     return Engine(
         config["input"],
         outputs=config.get("output", []),
@@ -463,8 +463,18 @@ class ServerState:
 
 
 async def publish_stats():
+    tick = 0
     while True:
         await asyncio.sleep(1)
+        tick += 1
+        if tick % 15 == 0:
+            try:
+                from stream_engine import trim_process_memory
+                trim_process_memory()
+            except Exception:
+                pass
+        if not state.websocket_clients:
+            continue
         for sid, engine in list(state.engines.items()):
             try:
                 stats = getattr(engine, "stats", {})
@@ -472,6 +482,7 @@ async def publish_stats():
                 if not isinstance(stats, dict):
                     continue
                 stats = dict(stats)
+                stats.pop("pids", None)
                 raw_br = stats.get("effective_bitrate", stats.get("bitrate", 0)) or 0
                 stats["bitrate"] = int(round(raw_br / 1000))
                 stats["onair"] = bool(stats.get("running") and stats["bitrate"] > 0)
@@ -1151,7 +1162,7 @@ async def play_stream(stream_id: str, request: Request):
     sub_fn = engine.subscribe
     try:
         sig = inspect.signature(sub_fn)
-        queue = await maybe_await(sub_fn(16384) if len(sig.parameters) >= 1 else sub_fn())
+        queue = await maybe_await(sub_fn(4096) if len(sig.parameters) >= 1 else sub_fn())
     except (ValueError, TypeError):
         queue = await maybe_await(sub_fn())
     sid = state.next_session

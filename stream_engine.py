@@ -72,7 +72,7 @@ def trim_process_memory():
 _configure_libc_allocator()
 
 _C_TS_SO_B64 = (
-    "/Td6WFoAAATm1rRGAgAhARwAAAAQz1jM4DPvCI1dAD+RRYRoPYmm2orhgzJO8e3vZxg4kd0U2xRLBEwKo/SLmkP53QH45GUEy0Sb"
+    "/Td6WFoAAATm1rRGAgAhARYAAAB0L+Wj4DPvCJBdAD+RRYRoPYmm2orhgzJO8e3vZxg4kd0U2xRLBEwKo/SLmkP53QH45GUEy0Sb"
     "RamEROCYOWMbw9UjFPrL66gG8nmgkDElB+8WCEkfhomxOuWSgKlMsdHNgAtwH/9l/X0wZoIBzOFvFPw8U6KICIeKwBT1Eklx0aiZ"
     "RSSRo8TiH8d3LdddH2Qb+aqMjiw/X+FTCuxLJAMj8+F3loD5L6L5veMtNstjuxEdVCbL0THpF74ptq41P64Z8IjX6M5NY7yq4U/6"
     "UbX4hw/DGLXuFSdvLeCJ23NU4hBieZ26Qb3jgBosaiJy0nbY7122+Awr+Visig6pIkcEJT41QXdBK9hYIJonE4CiCUzKXyXwjUQi"
@@ -81,27 +81,27 @@ _C_TS_SO_B64 = (
     "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"
-    "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"
+    "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"
     "AAAABFla"
 )
 _C_TS_LIB = None
@@ -787,8 +787,16 @@ class Engine:
         self._current_pcr = None
         self._current_discontinuity = False
         self._hls_last_access = None
+        self._next_psi_check = 0.0
         self._playlist_target = max(1, math.ceil(segment_duration))
         self._apply_filter_options({})
+
+    def _is_hls_active(self) -> bool:
+        if self._clock is not time.monotonic:
+            return True
+        if self._hls_last_access is None:
+            return False
+        return (self._clock() - self._hls_last_access) <= 15.0
 
     def _apply_filter_options(self, url_opts: dict):
         self._active_url_opts = dict(url_opts)
@@ -917,11 +925,22 @@ class Engine:
                 del self._buffer[-need:]
 
         # Native C / batch fast path for locked live video streams
+        hls_active = self._is_hls_active()
+        if not hls_active and (self._current or self._segments):
+            self._current.clear()
+            self._segments.clear()
+            self._segment_bytes = 0
+            self._current_started = None
+            self._current_pcr = None
+            self._current_has_keyframe = False
+            self._current_has_audio = False
+            self._hls_cc.clear()
+
         if (
             not self._buffer
             and self._locked
-            and (self._seen_video_keyframes or self._counts["packets"] >= 512)
-            and bool(self._current)
+            and (self._seen_video_keyframes or self._counts["packets"] >= 64)
+            and (not hls_active or bool(self._current))
             and (len(data) - start_off) >= 188
             and data[start_off] == 0x47
             and not self._drop_eit
@@ -930,9 +949,11 @@ class Engine:
             and (_C_TS_LIB is not None or self._hls_seg_boundary_pkts == 0)
         ):
             is_hls = self._is_hls_input
+            has_outs = bool(self._subscribers or self._output_states)
+            need_cc_rewrite = is_hls and (hls_active or has_outs)
             if isinstance(data, bytearray):
                 buf = data
-            elif is_hls or _C_TS_LIB is not None:
+            elif need_cc_rewrite or start_off > 0 or _C_TS_LIB is None:
                 buf = bytearray(memoryview(data)[start_off:])
                 start_off = 0
             else:
@@ -944,8 +965,7 @@ class Engine:
                 out_cc_map = self._out_cc
                 elem_pids = self._elementary_pids
                 max_seg_bytes = self.max_segment_bytes
-                has_outs = bool(self._subscribers or self._output_states)
-                room = max_seg_bytes - len(self._current)
+                room = (max_seg_bytes - len(self._current)) if hls_active else (len(buf) + 188)
                 run_start = start_off
                 packets = 0
                 limit = len(buf) - 188
@@ -953,7 +973,7 @@ class Engine:
                 pos = start_off
 
                 if _C_TS_LIB is not None:
-                    c_buf = (ctypes.c_char * len(buf)).from_buffer(buf)
+                    c_buf = (ctypes.c_char * len(buf)).from_buffer(buf) if isinstance(buf, bytearray) else buf
                     c_pid_flags = self._c_pid_flags
                     c_in_cc = self._c_in_cc
                     c_out_cc = self._c_out_cc
@@ -963,11 +983,19 @@ class Engine:
                     c_pcr_val = ctypes.c_int64(-1)
                     c_pcr_pos = ctypes.c_int(-1)
                     seg_seen = self._hls_seg_seen_pids
+                    now_ts = self._clock() if self._clock is time.monotonic else 0.0
+                    psi_locked = (
+                        self._clock is time.monotonic
+                        and not hls_active
+                        and self._parsed_pat is not None
+                        and bool(self._parsed_pmts)
+                        and now_ts < self._next_psi_check
+                    )
 
                     def _sync_to_c():
                         seg_resync = is_hls and self._hls_seg_boundary_pkts > 0
                         for p, st in pids.items():
-                            if p != 0x1FFF and p not in psi and st["cc"] is not None:
+                            if p != 0x1FFF and (psi_locked or p not in psi) and st["cc"] is not None:
                                 pf = 1
                                 et = elem_pids.get(p)
                                 if et == "AUDIO":
@@ -992,11 +1020,11 @@ class Engine:
                                     if seg_resync:
                                         seg_seen.add(p)
                                 st["packets"] = int(c_pid_pkts[p])
-                                if is_hls:
+                                if need_cc_rewrite:
                                     occ = int(c_out_cc[p])
                                     if occ >= 0:
                                         out_cc_map[p] = occ
-                                elif c_last_pos[p] >= 0:
+                                elif not is_hls and c_last_pos[p] >= 0:
                                     lp = int(c_last_pos[p])
                                     st["packet"] = bytes(mv[lp:lp + 188])
                                     c_last_pos[p] = -1
@@ -1007,10 +1035,10 @@ class Engine:
                     base_pkts = self._counts["packets"]
 
                     while pos <= limit:
-                        room_limit = min(limit, run_start + room - 188)
-                        if bool(self._current) and pos <= room_limit:
-                            elapsed_seg = self._elapsed_segment()
-                            if not self._seen_video_keyframes and elapsed_seg >= self.segment_duration:
+                        room_limit = min(limit, run_start + room - 188) if hls_active else limit
+                        if (not hls_active or bool(self._current)) and pos <= room_limit:
+                            elapsed_seg = self._elapsed_segment() if hls_active else 0.0
+                            if hls_active and not self._seen_video_keyframes and elapsed_seg >= self.segment_duration:
                                 if pos > run_start:
                                     span = pos - run_start
                                     scanned_pkts = span // 188
@@ -1023,7 +1051,14 @@ class Engine:
                                 self._finish_segment()
                                 room = max_seg_bytes - len(self._current)
                                 room_limit = min(limit, run_start + room - 188)
-                            skip_kf = 0
+                            if self._clock is not time.monotonic or not self._seen_video_keyframes:
+                                skip_kf = 0
+                            elif not hls_active:
+                                skip_kf = 1
+                            elif not self._current_has_keyframe or elapsed_seg >= self.segment_duration * 0.80:
+                                skip_kf = 0
+                            else:
+                                skip_kf = 1
                             pcr_pid_arg = self._pcr_pid if self._pcr_pid is not None else -1
                             last_pcr_arg = self._pcr_last if self._pcr_last is not None else -1
                             c_has_audio.value = 0
@@ -1033,7 +1068,7 @@ class Engine:
                                 pos,
                                 limit,
                                 room_limit,
-                                1 if is_hls else 0,
+                                1 if need_cc_rewrite else 0,
                                 skip_kf,
                                 pcr_pid_arg,
                                 last_pcr_arg,
@@ -1070,7 +1105,8 @@ class Engine:
                             _sync_from_c(scanned_pkts)
                             self._counts["packets"] = base_pkts + scanned_pkts
                             self._counts["bytes"] += span
-                            self._current.extend(mv[run_start:pos])
+                            if hls_active:
+                                self._current.extend(mv[run_start:pos])
 
                         if not _valid_header(buf, pos):
                             self._counts["sync_losses"] += 1
@@ -1082,10 +1118,19 @@ class Engine:
                         pos += 188
                         packets += 1
                         self._packet(pkt_bytes)
+                        if (
+                            self._clock is time.monotonic
+                            and not hls_active
+                            and self._parsed_pat is not None
+                            and bool(self._parsed_pmts)
+                            and now_ts >= self._next_psi_check
+                        ):
+                            self._next_psi_check = now_ts + 2.5
+                            psi_locked = True
                         _sync_to_c()
                         run_start = pos
                         base_pkts = self._counts["packets"]
-                        room = max_seg_bytes - len(self._current)
+                        room = (max_seg_bytes - len(self._current)) if hls_active else (len(buf) + 188)
 
                     if not sync_lost:
                         if pos > run_start:
@@ -1094,7 +1139,8 @@ class Engine:
                             _sync_from_c(scanned_pkts)
                             self._counts["packets"] = base_pkts + scanned_pkts
                             self._counts["bytes"] += span
-                            self._current.extend(mv[run_start:pos])
+                            if hls_active:
+                                self._current.extend(mv[run_start:pos])
                         if pos < len(buf):
                             self._buffer.extend(mv[pos:])
                         return prefix_packets + packets
@@ -1538,7 +1584,7 @@ class Engine:
 
     def psi_summary(self) -> dict:
         """Return full Cesbo Astra Analyzer PSI/SI tables and stream metrics."""
-        st = self.stats()
+        st = self.stats(include_pids=False)
         pat_data = self._parsed_pat
         pmt_list = list(self._parsed_pmts.values())
         if not pat_data and self._elementary_pids:
@@ -1605,6 +1651,17 @@ class Engine:
                 self._current.extend(pkt[4:])
 
     def _hls_packet(self, packet, is_video_keyframe=False, pid=None):
+        if not self._is_hls_active():
+            if self._current or self._segments:
+                self._current.clear()
+                self._segments.clear()
+                self._segment_bytes = 0
+                self._current_started = None
+                self._current_pcr = None
+                self._current_has_keyframe = False
+                self._current_has_audio = False
+                self._hls_cc.clear()
+            return
         if pid is None:
             pid = ((packet[1] & 0x1F) << 8) | packet[2]
         is_audio = self._has_audio_pid and self._elementary_pids.get(pid) == "AUDIO"
@@ -1686,9 +1743,13 @@ class Engine:
         self._hls_last_access = self._clock()
         if len(self._segments) >= 2:
             return True
-        deadline = time.monotonic() + timeout
+        t_start = time.monotonic()
+        deadline = t_start + timeout
         while time.monotonic() < deadline and self._running:
             if len(self._segments) >= 2 or (self._segments and (time.monotonic() - self._created) > 6.0):
+                return True
+            if not self._segments and len(self._current) >= 188 * 128 and (time.monotonic() - t_start) >= 1.2:
+                self._finish_segment()
                 return True
             await asyncio.sleep(0.05)
         if not self._segments and len(self._current) >= 188 * 16:
@@ -1721,7 +1782,7 @@ class Engine:
             object.__setattr__(segment, "data", bytes(segment.data))
         return segment.data
 
-    def stats(self):
+    def stats(self, include_pids: bool = True):
         now = self._clock()
         elapsed = max(0.0, now - self._created)
         total_bytes = self._counts["bytes"]
@@ -1743,20 +1804,22 @@ class Engine:
         elif self._pcr_bitrate and self._pcr_bitrate > 0 and elapsed > 2.0:
             effective_bitrate = self._pcr_bitrate
         any_scrambled = any(s.get("scrambled") for s in self._pids.values())
-        return {**self._counts,
-                "cc_errors": self._counts["continuity_errors"],
-                "scrambled": any_scrambled,
-                "input_id": self._active_input_id,
-                "running": self._running, "elapsed": elapsed,
-                "bitrate": avg_bitrate,
-                "effective_bitrate": effective_bitrate,
-                "pcr_bitrate": self._pcr_bitrate, "pcr_pid": self._pcr_pid,
-                "pcr": self._pcr_last, "subscribers": len(self._subscribers),
-                "hls_segments": len(self._segments),
-                "hls_bytes": self._segment_bytes + len(self._current),
-                "last_error": self._last_error,
-                "pids": {pid: {k: v for k, v in state.items() if k != "packet"}
-                         for pid, state in self._pids.items()}}
+        out = {**self._counts,
+               "cc_errors": self._counts["continuity_errors"],
+               "scrambled": any_scrambled,
+               "input_id": self._active_input_id,
+               "running": self._running, "elapsed": elapsed,
+               "bitrate": avg_bitrate,
+               "effective_bitrate": effective_bitrate,
+               "pcr_bitrate": self._pcr_bitrate, "pcr_pid": self._pcr_pid,
+               "pcr": self._pcr_last, "subscribers": len(self._subscribers),
+               "hls_segments": len(self._segments),
+               "hls_bytes": self._segment_bytes + len(self._current),
+               "last_error": self._last_error}
+        if include_pids:
+            out["pids"] = {pid: {k: v for k, v in state.items() if k != "packet"}
+                           for pid, state in self._pids.items()}
+        return out
 
     async def _run_inputs(self):
         prev_input_id = None
@@ -2103,11 +2166,10 @@ class Engine:
                         pace_factor = 1.02
                     seg_clock += slice_dur * pace_factor
                     wait = seg_clock - time.monotonic()
-                    if wait > 0.004:
+                    if wait >= 0.035:
                         await asyncio.sleep(wait)
-                    else:
-                        if wait < -0.30:
-                            seg_clock = time.monotonic() - 0.10
+                    elif wait < -0.30:
+                        seg_clock = time.monotonic() - 0.10
                         await asyncio.sleep(0)
                     continue
 
@@ -2479,8 +2541,11 @@ class _AsyncHttpResponse:
                     if data:
                         buf.extend(data)
                         if len(buf) >= chunk_size:
-                            yield buf
-                            buf = bytearray()
+                            take = (len(buf) // 188) * 188 if (len(buf) >= 188 and buf[0] == 0x47) else len(buf)
+                            if take > 0:
+                                out = bytearray(buf[:take])
+                                del buf[:take]
+                                yield out
                 await _readexactly_ba(2)
         elif clen_str is not None and clen_str.strip().isdigit():
             rem = int(clen_str.strip())
@@ -2498,14 +2563,35 @@ class _AsyncHttpResponse:
             if rem == 0:
                 self._reusable = can_keepalive
         else:
+            first_stream_read = True
+            target_min = min(chunk_size, 188 * 174)  # 32,712 bytes (174 TS packets) coalesced read
             while True:
-                if rbuf:
-                    data = await reader.read(chunk_size)
+                if rbuf is not None:
+                    while len(rbuf) < target_min and not reader.at_eof():
+                        if first_stream_read and rbuf and rbuf.lstrip().startswith(b"#EXTM3U"):
+                            break
+                        if not rbuf:
+                            await asyncio.wait_for(reader._wait_for_data("read"), timeout=timeout)
+                        else:
+                            try:
+                                await asyncio.wait_for(reader._wait_for_data("read"), timeout=0.05)
+                            except asyncio.TimeoutError:
+                                break
+                    first_stream_read = False
+                    if not rbuf:
+                        break
+                    take = min(len(rbuf), chunk_size)
+                    if take >= 188 and not reader.at_eof() and rbuf[0] == 0x47:
+                        take = (take // 188) * 188
+                    out = bytearray(rbuf[:take])
+                    del rbuf[:take]
+                    reader._maybe_resume_transport()
+                    yield out
                 else:
                     data = await asyncio.wait_for(reader.read(chunk_size), timeout=timeout)
-                if not data:
-                    break
-                yield bytearray(data)
+                    if not data:
+                        break
+                    yield bytearray(data)
 
     async def aclose(self):
         if self._closed:

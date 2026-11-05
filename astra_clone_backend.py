@@ -705,8 +705,14 @@ async def publish_stats():
                 prev_errors.pop(dead_sid, None)
         for sid, engine in list(state.engines.items()):
             try:
-                stats = getattr(engine, "stats", {})
-                stats = await maybe_await(stats() if callable(stats) else stats)
+                stats_fn = getattr(engine, "stats", {})
+                if callable(stats_fn):
+                    try:
+                        stats = await maybe_await(stats_fn(include_pids=False))
+                    except TypeError:
+                        stats = await maybe_await(stats_fn())
+                else:
+                    stats = stats_fn
                 if not isinstance(stats, dict):
                     continue
                 stats = dict(stats)

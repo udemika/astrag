@@ -40,7 +40,20 @@ else:
     APP_DIR = BUNDLE_DIR
 
 
+def _cli_config_arg():
+    argv = sys.argv[1:]
+    for i, arg in enumerate(argv):
+        if arg in ("-c", "--config") and i + 1 < len(argv):
+            return Path(argv[i + 1])
+        if arg.startswith("--config="):
+            return Path(arg.split("=", 1)[1])
+    return None
+
+
 def _default_config_file() -> Path:
+    cli_cfg = _cli_config_arg()
+    if cli_cfg is not None:
+        return cli_cfg
     if "ASTRA_CONFIG_FILE" in os.environ:
         return Path(os.environ["ASTRA_CONFIG_FILE"])
     for candidate in (Path("/etc/astrag/astrag.conf"), APP_DIR / "astrag.conf", APP_DIR / "astra-clone.conf"):
@@ -49,9 +62,107 @@ def _default_config_file() -> Path:
     return APP_DIR / "astrag.conf"
 
 
+def _migrate_legacy_conf_and_state(conf_path: Path):
+    """Migrate legacy KEY=VALUE /etc/astrag/astrag.conf + /var/lib/astrag/state.json into a unified JSON .conf."""
+    if not conf_path or conf_path.suffix != ".conf":
+        return
+    raw = ""
+    if conf_path.exists():
+        try:
+            raw = conf_path.read_text(encoding="utf-8-sig").strip()
+        except OSError:
+            return
+        if raw.startswith("{"):
+            return
+    kv = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            kv[k.strip()] = v.strip().strip("\"'")
+    legacy_state_path = None
+    if "ASTRA_STATE_FILE" in kv:
+        legacy_state_path = Path(kv["ASTRA_STATE_FILE"])
+    elif conf_path.name == "astrag.conf" and Path("/var/lib/astrag/state.json").exists():
+        legacy_state_path = Path("/var/lib/astrag/state.json")
+    if legacy_state_path and legacy_state_path != conf_path and legacy_state_path.exists():
+        try:
+            st_raw = legacy_state_path.read_text(encoding="utf-8-sig").strip()
+            st_data = json.loads(st_raw) if st_raw else {}
+            loaded = st_data.get("config") if isinstance(st_data, dict) and isinstance(st_data.get("config"), dict) else st_data
+            if isinstance(loaded, dict):
+                merged = {
+                    "port": int(kv.get("ASTRA_PORT", kv.get("PORT", loaded.get("port", loaded.get("control_port", 8000))))),
+                    "host": kv.get("ASTRA_HOST", kv.get("HOST", loaded.get("host", "0.0.0.0"))),
+                    "gid": loaded.get("gid", 466560),
+                    "auth": dict(loaded.get("auth", {"enable": True})),
+                    "users": copy.deepcopy(loaded.get("users", {})),
+                    "make_stream": copy.deepcopy(loaded.get("make_stream", [])),
+                    "categories": copy.deepcopy(loaded.get("categories", [])),
+                    "servers": copy.deepcopy(loaded.get("servers", [])),
+                    "softcam": copy.deepcopy(loaded.get("softcam", [])),
+                    "cas": copy.deepcopy(loaded.get("cas", [])),
+                    "dvb_tune": copy.deepcopy(loaded.get("dvb_tune", [])),
+                    "settings": copy.deepcopy(loaded.get("settings", {})),
+                    "hls": copy.deepcopy(loaded.get("hls", {})),
+                }
+                if "AUTH_ENABLE" in kv:
+                    merged["auth"]["enable"] = kv["AUTH_ENABLE"].lower() in ("true", "1", "yes")
+                for uinfo in merged["users"].values():
+                    if isinstance(uinfo, dict):
+                        pw = uinfo.get("password", "")
+                        if isinstance(pw, str) and pw.startswith("pbkdf2_sha256$") and verify_password("admin", pw):
+                            uinfo["password"] = "admin"
+                conf_path.parent.mkdir(parents=True, exist_ok=True)
+                conf_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                return
+        except Exception:
+            pass
+    if raw and not raw.startswith("{"):
+        merged = {
+            "port": int(kv.get("ASTRA_PORT", kv.get("PORT", 8000))),
+            "host": kv.get("ASTRA_HOST", kv.get("HOST", "0.0.0.0")),
+            "gid": 466560,
+            "auth": {"enable": kv.get("AUTH_ENABLE", "true").lower() in ("true", "1", "yes")},
+            "users": {
+                "admin": {
+                    "type": 1,
+                    "role": "admin",
+                    "enable": True,
+                    "password": "admin",
+                    "created": int(time.time()),
+                }
+            },
+            "make_stream": [],
+            "categories": [],
+            "servers": [],
+            "softcam": [],
+            "cas": [],
+            "dvb_tune": [],
+            "settings": {},
+            "hls": {},
+        }
+        try:
+            conf_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except Exception:
+            pass
+
+
 def _default_state_file() -> Path:
+    cli_cfg = _cli_config_arg()
+    if cli_cfg is not None:
+        _migrate_legacy_conf_and_state(cli_cfg)
+        return cli_cfg
+    if "ASTRA_CONFIG_FILE" in os.environ:
+        cfg_p = Path(os.environ["ASTRA_CONFIG_FILE"])
+        _migrate_legacy_conf_and_state(cfg_p)
+        return cfg_p
     if "ASTRA_STATE_FILE" in os.environ:
         return Path(os.environ["ASTRA_STATE_FILE"])
+    if Path("/etc/astrag/astrag.conf").exists():
+        cfg_p = Path("/etc/astrag/astrag.conf")
+        _migrate_legacy_conf_and_state(cfg_p)
+        return cfg_p
     if Path("/var/lib/astrag").is_dir():
         return Path("/var/lib/astrag/state.json")
     return APP_DIR / "state.json"
@@ -68,7 +179,30 @@ FAVICON_PNG = base64.b64decode(
 def read_options():
     result = {}
     if CONFIG_FILE.exists():
-        for line in CONFIG_FILE.read_text(encoding="utf-8-sig").splitlines():
+        try:
+            raw = CONFIG_FILE.read_text(encoding="utf-8-sig").strip()
+        except OSError:
+            return result
+        if raw.startswith("{"):
+            try:
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    cfg = data.get("config") if isinstance(data.get("config"), dict) else data
+                    p = cfg.get("port") or cfg.get("control_port")
+                    if p is not None and not isinstance(p, bool):
+                        result["ASTRA_PORT"] = str(p)
+                        result["PORT"] = str(p)
+                    h = cfg.get("host")
+                    if isinstance(h, str) and h.strip():
+                        result["ASTRA_HOST"] = h.strip()
+                        result["HOST"] = h.strip()
+                    auth_cfg = cfg.get("auth")
+                    if isinstance(auth_cfg, dict) and "enable" in auth_cfg:
+                        result["AUTH_ENABLE"] = "true" if auth_cfg.get("enable") else "false"
+            except ValueError:
+                pass
+            return result
+        for line in raw.splitlines():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
@@ -180,7 +314,7 @@ def default_admin():
         "type": 1,
         "role": "admin",
         "enable": True,
-        "password": _DEFAULT_ADMIN_HASH,
+        "password": "admin",
         "created": int(time.time()),
     }
 
@@ -231,45 +365,99 @@ def validate_config(config):
     return result
 
 
+def _format_config_payload(config):
+    if STATE_FILE.suffix == ".conf":
+        ordered = {
+            "port": int(config.get("port") or config.get("control_port") or PORT),
+            "host": str(config.get("host") or HOST),
+            "gid": config.get("gid", 466560),
+            "auth": config.get("auth", {"enable": False}),
+            "users": config.get("users", {}),
+            "make_stream": config.get("make_stream", []),
+            "categories": config.get("categories", []),
+            "servers": config.get("servers", []),
+            "softcam": config.get("softcam", []),
+            "cas": config.get("cas", []),
+            "dvb_tune": config.get("dvb_tune", []),
+            "settings": config.get("settings", {}),
+            "hls": config.get("hls", {}),
+        }
+        for k, v in config.items():
+            if k not in ordered and k != "control_port":
+                ordered[k] = v
+        return ordered
+    return {"config": config}
+
+
 def atomic_save(config):
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = _format_config_payload(config)
     name = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=STATE_FILE.parent,
                                          prefix=".astra-", suffix=".tmp", delete=False) as f:
             name = f.name
-            json.dump({"config": config}, f, ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.write("\n")
             f.flush()
             os.fsync(f.fileno())
+        try:
+            os.chmod(name, 0o640)
+        except OSError:
+            pass
         os.replace(name, STATE_FILE)
+    except PermissionError:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
     finally:
         if name and os.path.exists(name):
             os.unlink(name)
 
 
 def disk_config():
+    global PORT, HOST
     config = defaults()
     options = read_options()
     if "AUTH_ENABLE" in options:
         config["auth"]["enable"] = options["AUTH_ENABLE"].lower() in ("true", "1", "yes")
     if STATE_FILE.exists():
         try:
-            data = json.loads(STATE_FILE.read_text(encoding="utf-8-sig"))
+            raw_text = STATE_FILE.read_text(encoding="utf-8-sig").strip()
+            data = json.loads(raw_text) if raw_text else {}
         except (OSError, ValueError) as exc:
             raise HTTPException(500, "Cannot read state file") from exc
         if not isinstance(data, dict) or not isinstance(data.get("config", data), dict):
             raise HTTPException(422, "State file must contain a configuration object")
-        loaded = data.get("config", data)
+        loaded = data.get("config") if isinstance(data.get("config"), dict) else data
         config.update(loaded)
         if not config.get("users"):
             config["users"] = {"admin": default_admin()}
         # Legacy streams are migrated only if authoritative make_stream is absent.
         if "make_stream" not in loaded and isinstance(data.get("streams"), dict):
             config["make_stream"] = [dict(v, id=k) for k, v in data["streams"].items()]
+        # If user manually added a stream in .conf without an id, generate a deterministic id.
+        if STATE_FILE.suffix == ".conf" and isinstance(config.get("make_stream"), list):
+            for idx, item in enumerate(config["make_stream"]):
+                if isinstance(item, dict) and not item.get("id"):
+                    seed = f"{item.get('name', '')}-{idx}-{item.get('input', '')}"
+                    item["id"] = f"a{abs(hash(seed)) % 100000:05d}"
     enabled = os.environ.get("ASTRA_AUTH_ENABLE")
     if enabled is not None:
         config["auth"] = dict(config.get("auth", {}), enable=enabled.lower() in ("true", "1", "yes"))
+    cfg_port = config.get("port")
+    if isinstance(cfg_port, int) and not isinstance(cfg_port, bool) and 1 <= cfg_port <= 65535:
+        PORT = cfg_port
+    elif isinstance(cfg_port, str) and cfg_port.isdigit() and 1 <= int(cfg_port) <= 65535:
+        PORT = int(cfg_port)
+    config["port"] = PORT
     config["control_port"] = PORT
+    if isinstance(config.get("host"), str) and config["host"].strip():
+        HOST = config["host"].strip()
+    else:
+        config["host"] = HOST
     return validate_config(config)
 
 
@@ -841,8 +1029,8 @@ async def control_api(request: Request):
                 for ulogin, udata in uploaded["users"].items():
                     if isinstance(udata, dict):
                         pw = udata.get("password")
-                        if isinstance(pw, str) and pw and not pw.startswith("pbkdf2_sha256$"):
-                            udata["password"] = hash_password(pw)
+                        if isinstance(pw, str) and pw:
+                            udata["password"] = pw
                         elif not pw and ulogin in config.get("users", {}):
                             if "password" in config["users"][ulogin]:
                                 udata["password"] = config["users"][ulogin]["password"]
@@ -914,15 +1102,12 @@ async def control_api(request: Request):
                 merged.update(data)
                 raw_pw = data.get("password")
                 if isinstance(raw_pw, str) and raw_pw:
-                    if not raw_pw.startswith("pbkdf2_sha256$"):
-                        merged["password"] = hash_password(raw_pw)
-                    else:
-                        merged["password"] = raw_pw
+                    merged["password"] = raw_pw
                     merged.pop("firstrun", None)
                 elif "password" in existing:
                     merged["password"] = existing["password"]
                 else:
-                    merged["password"] = hash_password("admin")
+                    merged["password"] = "admin"
                 try:
                     utype = int(merged.get("type", 1 if merged.get("role") == "admin" else 3))
                 except (ValueError, TypeError):
@@ -1662,7 +1847,7 @@ if STATIC_DIR.is_dir():
 
 
 def main() -> int:
-    global PORT, HOST, CONFIG_FILE
+    global PORT, HOST, CONFIG_FILE, STATE_FILE
     try:
         import ctypes
         libc = ctypes.CDLL("libc.so.6")
@@ -1676,12 +1861,14 @@ def main() -> int:
     args, _ = parser.parse_known_args()
     if args.config:
         CONFIG_FILE = Path(args.config)
+        _migrate_legacy_conf_and_state(CONFIG_FILE)
+        STATE_FILE = CONFIG_FILE
         opts = read_options()
-        if "-p" not in sys.argv and "--port" not in sys.argv and ("ASTRA_PORT" in opts or "PORT" in opts):
+        if "ASTRA_PORT" in opts or "PORT" in opts:
             PORT = int(opts.get("ASTRA_PORT", opts.get("PORT", PORT)))
         else:
             PORT = args.port
-        if "--host" not in sys.argv and ("ASTRA_HOST" in opts or "HOST" in opts):
+        if "ASTRA_HOST" in opts or "HOST" in opts:
             HOST = opts.get("ASTRA_HOST", opts.get("HOST", HOST))
         else:
             HOST = args.host

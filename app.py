@@ -36,14 +36,10 @@ except ImportError:
     except Exception:
         get_pip = Path("/tmp/get-pip.py")
         urllib.request.urlretrieve("https://bootstrap.pypa.io/get-pip.py", get_pip)
-        subprocess.run(
-            [sys.executable, str(get_pip), "--break-system-packages", "-q"],
-            check=True,
-        )
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--break-system-packages", "-q", "-r", str(req_file)],
-        check=True,
-    )
+        if subprocess.run([sys.executable, str(get_pip), "-q"], check=False).returncode != 0:
+            subprocess.run([sys.executable, str(get_pip), "--break-system-packages", "-q"], check=True)
+    if subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", str(req_file)], check=False).returncode != 0:
+        subprocess.run([sys.executable, "-m", "pip", "install", "--break-system-packages", "-q", "-r", str(req_file)], check=True)
     import uvicorn
 
 from astra_clone_backend import app, PORT

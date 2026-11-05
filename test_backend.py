@@ -282,6 +282,39 @@ class BackendTests(unittest.TestCase):
             self.assertEqual(loaded[0]["name"], "Матч Боец HD")
             self.assertEqual(loaded[0]["input"][0], full_url)
 
+    def test_unified_astrag_conf_and_multiport_isolation(self):
+        conf_8000 = Path(self.temp.name) / "astrag.conf"
+        conf_8001 = Path(self.temp.name) / "astrag8001.conf"
+        with patch.object(backend, "STATE_FILE", conf_8000), patch.object(backend, "CONFIG_FILE", conf_8000), patch.object(backend, "PORT", 8000):
+            self.assertEqual(self.cmd("restart").status_code, 200)
+            self.assertEqual(self.stream(sid="ch1", name="REX UHD", input=["http://31.131.139.253:9002/rex_uhd/index.m3u8"]).status_code, 200)
+            saved_8000 = json.loads(conf_8000.read_text(encoding="utf-8"))
+            # Top-level Cesbo Astra JSON format (no {"config": ...} wrapper)
+            self.assertEqual(saved_8000["port"], 8000)
+            self.assertEqual(saved_8000["users"]["admin"]["password"], "admin")
+            self.assertEqual(len(saved_8000["make_stream"]), 1)
+            self.assertEqual(saved_8000["make_stream"][0]["name"], "REX UHD")
+            # Edit password, port, and add a channel directly inside astrag.conf
+            saved_8000["port"] = 8080
+            saved_8000["users"]["admin"]["password"] = "mycustompass"
+            saved_8000["make_stream"].append({
+                "name": "Manual Channel",
+                "input": ["http://31.184.196.172:620/ntv.php?id=5006d4375028edc979000160"],
+            })
+            conf_8000.write_text(json.dumps(saved_8000, indent=2), encoding="utf-8")
+            self.assertEqual(self.cmd("restart").status_code, 200)
+            loaded_8000 = self.cmd("load").json()
+            self.assertEqual(loaded_8000["port"], 8080)
+            self.assertEqual(loaded_8000["users"]["admin"]["password"], "mycustompass")
+            self.assertEqual(len(loaded_8000["make_stream"]), 2)
+
+        # Now switch to a second instance on port 8001 with its own astrag8001.conf (must start empty, not a clone)
+        with patch.object(backend, "STATE_FILE", conf_8001), patch.object(backend, "CONFIG_FILE", conf_8001), patch.object(backend, "PORT", 8001):
+            self.assertEqual(self.cmd("restart").status_code, 200)
+            loaded_8001 = self.cmd("load").json()
+            self.assertEqual(loaded_8001["port"], 8001)
+            self.assertEqual(loaded_8001["make_stream"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

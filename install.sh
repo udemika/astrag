@@ -47,14 +47,17 @@ SERVICE_USER=astrag
 
 if "$UNINSTALL"; then
     echo "==> Stopping and removing AstraG services..."
-    systemctl stop astrag.service 2>/dev/null || true
-    systemctl disable astrag.service 2>/dev/null || true
-    systemctl stop astra-clone.service 2>/dev/null || true
-    systemctl disable astra-clone.service 2>/dev/null || true
+    for unit_p in /etc/systemd/system/astrag*.service /etc/systemd/system/astra-clone.service; do
+        if [ -f "$unit_p" ]; then
+            u_name="$(basename "$unit_p")"
+            systemctl stop "$u_name" 2>/dev/null || true
+            systemctl disable "$u_name" 2>/dev/null || true
+            rm -f "$unit_p"
+        fi
+    done
     pkill -f "astra_clone_backend.py" 2>/dev/null || true
     pkill -f "astrag_backend.py" 2>/dev/null || true
     pkill -f "/opt/astrag/astrag" 2>/dev/null || true
-    rm -f /etc/systemd/system/astrag.service /etc/systemd/system/astra-clone.service
     systemctl daemon-reload || true
     systemctl reset-failed 2>/dev/null || true
     rm -f /usr/bin/astrag /usr/bin/astra-clone
@@ -118,7 +121,7 @@ fi
 if [ "$(id -u "$SERVICE_USER")" -eq 0 ]; then echo "Refusing root service user" >&2; exit 1; fi
 
 install -d -o root -g root -m 0755 "$APP_DIR" "$STATIC_DIR"
-install -d -o root -g "$SERVICE_USER" -m 0750 "$CONFIG_DIR"
+install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$CONFIG_DIR"
 install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$STATE_DIR"
 
 # Seamless migration from legacy /var/lib/astra-clone and /etc/astra-clone if present
@@ -246,31 +249,113 @@ chown root:root /usr/bin/astrag
 chmod 0755 /usr/bin/astrag
 ln -sf /usr/bin/astrag /usr/bin/astra-clone
 
-if [ ! -e "$CONFIG_DIR/astrag.conf" ]; then
-    (umask 027; cat > "$CONFIG_DIR/astrag.conf" <<EOF
-ASTRA_HOST=0.0.0.0
-ASTRA_PORT=${CUSTOM_PORT:-8000}
-ASTRA_STATIC_DIR=/opt/astrag/www
-ASTRA_STATE_FILE=/var/lib/astrag/state.json
-ASTRA_CONFIG_FILE=/etc/astrag/astrag.conf
-EOF
-    )
-elif [ -n "$CUSTOM_PORT" ]; then
-    if grep -q "^ASTRA_PORT=" "$CONFIG_DIR/astrag.conf"; then
-        sed -i "s/^ASTRA_PORT=.*/ASTRA_PORT=${CUSTOM_PORT}/" "$CONFIG_DIR/astrag.conf"
-    else
-        echo "ASTRA_PORT=${CUSTOM_PORT}" >> "$CONFIG_DIR/astrag.conf"
-    fi
+if [ "${CUSTOM_PORT:-8000}" = "8000" ]; then
+    SERVICE_NAME="astrag"
+else
+    SERVICE_NAME="astrag${CUSTOM_PORT}"
 fi
-if ! grep -q "^ASTRA_HOST=" "$CONFIG_DIR/astrag.conf"; then
-    echo "ASTRA_HOST=0.0.0.0" >> "$CONFIG_DIR/astrag.conf"
-fi
-chown root:"$SERVICE_USER" "$CONFIG_DIR/astrag.conf"
-chmod 0640 "$CONFIG_DIR/astrag.conf"
+CONF_FILE="$CONFIG_DIR/${SERVICE_NAME}.conf"
 
+python3 - "$CONF_FILE" "${CUSTOM_PORT:-8000}" "$SERVICE_NAME" "$STATE_DIR/state.json" "$APP_DIR" <<'PYEOF'
+import json, os, sys, time
+from pathlib import Path
+
+conf_file = Path(sys.argv[1])
+port = int(sys.argv[2])
+service_name = sys.argv[3]
+legacy_state = Path(sys.argv[4])
+app_dir = Path(sys.argv[5])
+sys.path.insert(0, str(app_dir))
+try:
+    from account_security import verify_password
+except Exception:
+    verify_password = lambda p, s: False
+
+default_cfg = {
+    "port": port,
+    "host": "0.0.0.0",
+    "gid": 466560,
+    "auth": {"enable": True},
+    "users": {
+        "admin": {
+            "type": 1,
+            "role": "admin",
+            "enable": True,
+            "password": "admin",
+            "created": int(time.time()),
+        }
+    },
+    "make_stream": [],
+    "categories": [],
+    "servers": [],
+    "softcam": [],
+    "cas": [],
+    "dvb_tune": [],
+    "settings": {},
+    "hls": {},
+}
+
+existing = None
+if conf_file.exists():
+    raw = conf_file.read_text(encoding="utf-8-sig").strip()
+    if raw.startswith("{"):
+        try:
+            d = json.loads(raw)
+            if isinstance(d, dict):
+                existing = d.get("config") if isinstance(d.get("config"), dict) else d
+        except Exception:
+            existing = None
+
+if existing is None and service_name == "astrag" and legacy_state.exists():
+    try:
+        st_raw = legacy_state.read_text(encoding="utf-8-sig").strip()
+        st_d = json.loads(st_raw) if st_raw else {}
+        if isinstance(st_d, dict):
+            existing = st_d.get("config") if isinstance(st_d.get("config"), dict) else st_d
+    except Exception:
+        existing = None
+
+if isinstance(existing, dict):
+    merged = dict(default_cfg)
+    merged.update(existing)
+    merged["port"] = port
+    merged.pop("control_port", None)
+    if isinstance(merged.get("users"), dict):
+        for uinfo in merged["users"].values():
+            if isinstance(uinfo, dict):
+                pw = uinfo.get("password", "")
+                if isinstance(pw, str) and pw.startswith("pbkdf2_sha256$") and verify_password("admin", pw):
+                    uinfo["password"] = "admin"
+    ordered = {
+        "port": merged["port"],
+        "host": merged.get("host", "0.0.0.0"),
+        "gid": merged.get("gid", 466560),
+        "auth": merged.get("auth", {"enable": True}),
+        "users": merged.get("users", default_cfg["users"]),
+        "make_stream": merged.get("make_stream", []),
+        "categories": merged.get("categories", []),
+        "servers": merged.get("servers", []),
+        "softcam": merged.get("softcam", []),
+        "cas": merged.get("cas", []),
+        "dvb_tune": merged.get("dvb_tune", []),
+        "settings": merged.get("settings", {}),
+        "hls": merged.get("hls", {}),
+    }
+    conf_file.write_text(json.dumps(ordered, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+else:
+    conf_file.write_text(json.dumps(default_cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PYEOF
+
+chown -R "$SERVICE_USER:$SERVICE_USER" "$CONFIG_DIR"
+chmod 0640 "$CONF_FILE"
+
+UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 SERVICE_SRC="$SCRIPT_DIR/astrag.service"
-install -o root -g root -m 0644 "$SERVICE_SRC" /etc/systemd/system/astrag.service
-sed -i "s|^ExecStart=.*|ExecStart=${EXEC_START_CMD}|" /etc/systemd/system/astrag.service
+install -o root -g root -m 0644 "$SERVICE_SRC" "$UNIT_FILE"
+sed -i "s|^Description=.*|Description=AstraG Control Panel and IPTV Streaming Server (${SERVICE_NAME})|" "$UNIT_FILE"
+sed -i "s|^Environment=\"ASTRA_STATE_FILE=.*|Environment=\"ASTRA_STATE_FILE=${CONF_FILE}\"|" "$UNIT_FILE"
+sed -i "s|^Environment=\"ASTRA_CONFIG_FILE=.*|Environment=\"ASTRA_CONFIG_FILE=${CONF_FILE}\"|" "$UNIT_FILE"
+sed -i "s|^ExecStart=.*|ExecStart=${EXEC_START_CMD} -c ${CONF_FILE}|" "$UNIT_FILE"
 
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
     ufw allow "${CUSTOM_PORT:-8000}/tcp" >/dev/null 2>&1 || true
@@ -278,25 +363,26 @@ fi
 
 systemctl daemon-reload
 if "$START"; then
-    systemctl enable astrag.service
-    systemctl restart astrag.service
+    systemctl enable "${SERVICE_NAME}.service"
+    systemctl restart "${SERVICE_NAME}.service"
     sleep 1
-    if ! systemctl is-active --quiet astrag.service; then
-        echo "ERROR: astrag.service failed to start. Recent logs:" >&2
-        journalctl -u astrag.service -n 30 --no-pager >&2 || true
+    if ! systemctl is-active --quiet "${SERVICE_NAME}.service"; then
+        echo "ERROR: ${SERVICE_NAME}.service failed to start. Recent logs:" >&2
+        journalctl -u "${SERVICE_NAME}.service" -n 30 --no-pager >&2 || true
         exit 1
     fi
     SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || echo '127.0.0.1')"
     echo "================================================================"
-    echo " AstraG successfully installed and started! (Mode: ${INSTALL_MODE})"
+    echo " AstraG (${SERVICE_NAME}) successfully installed and started!"
+    echo " Config File       : ${CONF_FILE}"
     echo " Web Control Panel : http://${SERVER_IP}:${CUSTOM_PORT:-8000}"
     echo " Default Login     : admin"
     echo " Default Password  : admin"
     echo " Playlist M3U8     : http://${SERVER_IP}:${CUSTOM_PORT:-8000}/playlist.m3u8"
     echo "================================================================"
 else
-    echo "Installed AstraG (${INSTALL_MODE} mode) into /opt/astrag. Start with: sudo systemctl enable --now astrag.service"
+    echo "Installed AstraG (${SERVICE_NAME}) with config ${CONF_FILE}. Start with: sudo systemctl enable --now ${SERVICE_NAME}.service"
 fi
-echo "Logs: sudo journalctl -u astrag.service -f"
+echo "Logs: sudo journalctl -u ${SERVICE_NAME}.service -f"
 
 

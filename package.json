@@ -3,8 +3,8 @@
   "private": true,
   "version": "2.0.0",
   "scripts": {
-    "dev": "python3 -m http.server 3000",
-    "start": "python3 -m http.server 3000",
+    "dev": "python3 app.py",
+    "start": "python3 app.py",
     "build": "echo 'No build step required'"
   }
 }

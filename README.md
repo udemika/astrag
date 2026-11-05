@@ -103,12 +103,42 @@ sudo systemctl status astrag
 sudo journalctl -u astrag -f
 ```
 
-### Запуск дополнительного экземпляра на другом порту
-Как и в оригинальной Cesbo Astra, вы можете зарегистрировать несколько независимых сервисов на разных портах:
+### Конфигурационный файл `/etc/astrag/astrag.conf`
+Как и в оригинальной Cesbo Astra, **все настройки сервера** (порт `port`, пользователи и пароли в открытом виде `users`, список телеканалов `make_stream`, категории `categories`, кластерные серверы `servers`) хранятся в едином JSON-файле `/etc/astrag/astrag.conf`:
+```json
+{
+  "port": 8000,
+  "host": "0.0.0.0",
+  "gid": 466560,
+  "auth": {
+    "enable": true
+  },
+  "users": {
+    "admin": {
+      "type": 1,
+      "role": "admin",
+      "enable": true,
+      "password": "admin",
+      "created": 1793775989
+    }
+  },
+  "make_stream": []
+}
+```
+Вы можете редактировать порт, пароли и добавлять каналы прямо в `/etc/astrag/astrag.conf` (после правок выполните `sudo systemctl restart astrag`).
+
+### Запуск нового пустого экземпляра AstraG на другом порту (например, `8001`)
+Если указать другой порт (например `8001`), автоматически создается **новый независимый пустой экземпляр** со своим файлом `/etc/astrag/astrag8001.conf` и отдельной службой `astrag8001`:
 ```bash
-sudo astrag init 8001 astrag-backup
-sudo systemctl start astrag-backup
-sudo systemctl enable astrag-backup
+# Создание и запуск нового пустого экземпляра на порту 8001 (/etc/astrag/astrag8001.conf):
+sudo astrag init 8001 --start
+
+# Управление вторым экземпляром:
+sudo systemctl status astrag8001
+sudo systemctl restart astrag8001
+
+# Удаление только экземпляра 8001:
+sudo astrag remove 8001 --purge
 ```
 
 ### Сброс пароля администратора через консоль
@@ -121,13 +151,12 @@ sudo systemctl restart astrag
 
 ## Обновление AstraG
 
-Для обновления достаточно скачать свежий файл `/usr/bin/astrag` и перезапустить сервис (все ваши потоки и настройки в `/var/lib/astrag/state.json` сохраняются):
+Для обновления достаточно скачать свежий файл `/usr/bin/astrag` и перезапустить сервис (все ваши потоки и настройки в `/etc/astrag/astrag.conf` сохраняются, а старый `/var/lib/astrag/state.json` автоматически переносится в `/etc/astrag/astrag.conf`):
 
 ```bash
 sudo curl -Lo /usr/bin/astrag https://raw.githubusercontent.com/udemika/astrag/main/astrag
 sudo chmod +x /usr/bin/astrag
-sudo astrag init 8000
-sudo systemctl restart astrag
+sudo astrag init 8000 --start
 ```
 
 ---

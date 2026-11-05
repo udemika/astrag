@@ -3859,16 +3859,34 @@ $(function () {
             var al = appHost.config.dvb_tune
             if (data.adapter.remove) {
                 var idx = !al ? -1 : al.indexOfID(data.adapter.id)
-                if (!data.adapter.up) {
+                if (!data.adapter.up && idx != -1 && al[idx]) {
                     $.msg({
                         title: 'Adapter "{0}" removed'.format(al[idx].name),
                     })
                 }
-                MainModule.adapters[host + '/' + data.adapter.id].remove()
-                al.splice(idx, 1)
-                if (!al.length) delete appHost.config.dvb_tune
+                if (MainModule.adapters[host + '/' + data.adapter.id]) {
+                    MainModule.adapters[host + '/' + data.adapter.id].remove()
+                }
+                if (idx != -1) {
+                    al.splice(idx, 1)
+                    if (!al.length) delete appHost.config.dvb_tune
+                }
             } else {
-                if (!al) appHost.config.dvb_tune = al = []
+                var prevAdapterId = data.id || data.adapter.id
+                if (prevAdapterId && MainModule.adapters[host + '/' + prevAdapterId]) {
+                    MainModule.adapters[host + '/' + prevAdapterId].remove()
+                }
+                if (MainModule.adapters[host + '/' + data.adapter.id]) {
+                    MainModule.adapters[host + '/' + data.adapter.id].remove()
+                }
+                if (al) {
+                    var oldAIdx = prevAdapterId ? al.indexOfID(prevAdapterId) : -1
+                    if (oldAIdx != -1) al.splice(oldAIdx, 1)
+                    var curAIdx = al.indexOfID(data.adapter.id)
+                    if (curAIdx != -1) al.splice(curAIdx, 1)
+                } else {
+                    appHost.config.dvb_tune = al = []
+                }
                 al.push(data.adapter)
                 renderAdapter(host, data.adapter)
                 $.msg({
@@ -3915,16 +3933,34 @@ $(function () {
             var sl = appHost.config.make_stream
             if (data.stream.remove) {
                 var idx = !sl ? -1 : sl.indexOfID(data.stream.id)
-                if (!data.stream.up) {
+                if (!data.stream.up && idx != -1 && sl[idx]) {
                     $.msg({
                         title: 'Stream "{0}" removed'.format(sl[idx].name),
                     })
                 }
-                MainModule.streams[host + '/' + data.stream.id].remove()
-                sl.splice(idx, 1)
-                if (!sl.length) delete appHost.config.make_stream
+                if (MainModule.streams[host + '/' + data.stream.id]) {
+                    MainModule.streams[host + '/' + data.stream.id].remove()
+                }
+                if (idx != -1) {
+                    sl.splice(idx, 1)
+                    if (!sl.length) delete appHost.config.make_stream
+                }
             } else {
-                if (!sl) appHost.config.make_stream = sl = []
+                var prevStreamId = data.id || data.stream.id
+                if (prevStreamId && MainModule.streams[host + '/' + prevStreamId]) {
+                    MainModule.streams[host + '/' + prevStreamId].remove()
+                }
+                if (MainModule.streams[host + '/' + data.stream.id]) {
+                    MainModule.streams[host + '/' + data.stream.id].remove()
+                }
+                if (sl) {
+                    var oldSIdx = prevStreamId ? sl.indexOfID(prevStreamId) : -1
+                    if (oldSIdx != -1) sl.splice(oldSIdx, 1)
+                    var curSIdx = sl.indexOfID(data.stream.id)
+                    if (curSIdx != -1) sl.splice(curSIdx, 1)
+                } else {
+                    appHost.config.make_stream = sl = []
+                }
                 sl.push(data.stream)
                 renderStream(host, data.stream)
                 $.msg({

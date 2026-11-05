@@ -395,7 +395,29 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(dur)
         self.assertGreater(dur, 2.0)
 
+    def test_hls_variant_selection_and_key_parser(self):
+        from stream_engine import _select_best_hls_variant, _parse_hls_key_tag
+        master_lines = [
+            "#EXTM3U",
+            "#EXT-X-STREAM-INF:BANDWIDTH=950000,RESOLUTION=512x288",
+            "1011-288p.m3u8",
+            "#EXT-X-STREAM-INF:BANDWIDTH=5500000,RESOLUTION=1920x1080",
+            "1011-1080p.m3u8",
+            '#EXT-X-STREAM-INF:BANDWIDTH=64,CODECS="mp4a.40.2"',
+            "1011-audio.m3u8",
+        ]
+        best = _select_best_hls_variant(master_lines, "https://vb-rtb.uma.media/hls/1011.m3u8")
+        self.assertEqual(best, "https://vb-rtb.uma.media/hls/1011-1080p.m3u8")
+        key_info = _parse_hls_key_tag(
+            '#EXT-X-KEY:METHOD=AES-128,URI="https://legacy.ntvplus.tv/phls/3m/hls-key/k.bin",IV=0x0000000000000000000000000003ea49',
+            "https://vb-rtb.uma.media/hls/1011-1080p.m3u8",
+        )
+        self.assertIsNotNone(key_info)
+        self.assertEqual(key_info[0], "https://legacy.ntvplus.tv/phls/3m/hls-key/k.bin")
+        self.assertEqual(key_info[1], (0x3EA49).to_bytes(16, "big"))
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

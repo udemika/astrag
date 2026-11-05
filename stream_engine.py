@@ -159,6 +159,168 @@ def _load_c_ts_accelerator():
 
 _load_c_ts_accelerator()
 
+_LIBCRYPTO = None
+
+
+def _load_libcrypto():
+    global _LIBCRYPTO
+    if os.name != "posix":
+        return
+    for soname in ("libcrypto.so.3", "libcrypto.so.1.1", "libcrypto.so"):
+        try:
+            lib = ctypes.CDLL(soname)
+            lib.EVP_CIPHER_CTX_new.argtypes = []
+            lib.EVP_CIPHER_CTX_new.restype = ctypes.c_void_p
+            lib.EVP_CIPHER_CTX_free.argtypes = [ctypes.c_void_p]
+            lib.EVP_CIPHER_CTX_free.restype = None
+            lib.EVP_aes_128_cbc.argtypes = []
+            lib.EVP_aes_128_cbc.restype = ctypes.c_void_p
+            lib.EVP_DecryptInit_ex.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_char_p,
+                ctypes.c_char_p,
+            ]
+            lib.EVP_DecryptInit_ex.restype = ctypes.c_int
+            lib.EVP_DecryptUpdate.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.c_char_p,
+                ctypes.c_int,
+            ]
+            lib.EVP_DecryptUpdate.restype = ctypes.c_int
+            lib.EVP_DecryptFinal_ex.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_int),
+            ]
+            lib.EVP_DecryptFinal_ex.restype = ctypes.c_int
+            _LIBCRYPTO = lib
+            break
+        except Exception:
+            continue
+
+
+_load_libcrypto()
+
+
+class _HlsAes128Decryptor:
+    """Zero-dependency OpenSSL EVP_aes_128_cbc streaming segment decryptor."""
+
+    __slots__ = ("_ctx", "_buf", "_outl")
+
+    def __init__(self, key: bytes, iv: bytes):
+        self._ctx = None
+        self._buf = None
+        self._outl = ctypes.c_int(0)
+        if _LIBCRYPTO is not None and len(key) == 16 and len(iv) == 16:
+            ctx = _LIBCRYPTO.EVP_CIPHER_CTX_new()
+            if ctx:
+                if _LIBCRYPTO.EVP_DecryptInit_ex(ctx, _LIBCRYPTO.EVP_aes_128_cbc(), None, key, iv) == 1:
+                    self._ctx = ctx
+                else:
+                    _LIBCRYPTO.EVP_CIPHER_CTX_free(ctx)
+
+    def update(self, data: bytes | bytearray) -> bytearray:
+        if not self._ctx or not data:
+            return bytearray(data)
+        raw = bytes(data) if isinstance(data, bytearray) else data
+        need = len(raw) + 32
+        if self._buf is None or len(self._buf) < need:
+            self._buf = ctypes.create_string_buffer(need)
+        self._outl.value = 0
+        if _LIBCRYPTO.EVP_DecryptUpdate(self._ctx, self._buf, ctypes.byref(self._outl), raw, len(raw)) == 1:
+            if self._outl.value > 0:
+                return bytearray(self._buf.raw[: self._outl.value])
+            return bytearray()
+        return bytearray()
+
+    def finalize(self) -> bytearray:
+        if not self._ctx:
+            return bytearray()
+        if self._buf is None or len(self._buf) < 32:
+            self._buf = ctypes.create_string_buffer(32)
+        self._outl.value = 0
+        res = _LIBCRYPTO.EVP_DecryptFinal_ex(self._ctx, self._buf, ctypes.byref(self._outl))
+        self.close()
+        if res == 1 and self._outl.value > 0:
+            return bytearray(self._buf.raw[: self._outl.value])
+        return bytearray()
+
+    def close(self):
+        if self._ctx and _LIBCRYPTO is not None:
+            _LIBCRYPTO.EVP_CIPHER_CTX_free(self._ctx)
+            self._ctx = None
+
+
+def _parse_hls_key_tag(line: str, base_url: str):
+    """Parse #EXT-X-KEY tag into (method, key_url, iv_bytes_or_none)."""
+    body = line.split(":", 1)[1].strip() if ":" in line else ""
+    if not body or "METHOD=NONE" in body.upper():
+        return None
+    if "METHOD=AES-128" not in body.upper():
+        return None
+    uri_val = None
+    iv_bytes = None
+    pos = body.find('URI="')
+    if pos != -1:
+        end = body.find('"', pos + 5)
+        if end != -1:
+            uri_val = body[pos + 5 : end].strip()
+    if not uri_val:
+        return None
+    key_url = urljoin(base_url, uri_val)
+    iv_pos = body.upper().find("IV=")
+    if iv_pos != -1:
+        iv_raw = body[iv_pos + 3 :].split(",", 1)[0].strip().strip('"')
+        if iv_raw.lower().startswith("0x"):
+            iv_raw = iv_raw[2:]
+        try:
+            iv_bytes = int(iv_raw, 16).to_bytes(16, "big")
+        except Exception:
+            iv_bytes = None
+    return (key_url, iv_bytes)
+
+
+def _select_best_hls_variant(lines: list[str], resp_url: str) -> str | None:
+    """Select the highest-bandwidth video variant from a master M3U8 playlist."""
+    candidates = []
+    for i, line in enumerate(lines):
+        if line.startswith("#EXT-X-STREAM-INF") and i + 1 < len(lines):
+            nxt = lines[i + 1]
+            if nxt.startswith("#"):
+                continue
+            v_url = urljoin(resp_url, nxt)
+            bw = 0
+            has_video = True
+            upper_line = line.upper()
+            for attr in line.split(":", 1)[-1].split(","):
+                attr_s = attr.strip()
+                if attr_s.upper().startswith("BANDWIDTH="):
+                    try:
+                        bw = int(attr_s.split("=", 1)[1].strip())
+                    except ValueError:
+                        pass
+            if "AUDIO" in nxt.upper() and "RESOLUTION=" not in upper_line:
+                has_video = False
+            elif bw > 0 and bw < 120000 and "RESOLUTION=" not in upper_line:
+                has_video = False
+            elif 'CODECS="' in upper_line and "RESOLUTION=" not in upper_line:
+                codecs_pos = upper_line.find('CODECS="')
+                codecs_end = upper_line.find('"', codecs_pos + 8)
+                if codecs_end != -1:
+                    codecs_str = upper_line[codecs_pos + 8 : codecs_end]
+                    if "AVC" not in codecs_str and "HVC" not in codecs_str and "HEV" not in codecs_str and "MP4V" not in codecs_str:
+                        has_video = False
+            candidates.append((1 if has_video else 0, bw, v_url))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return candidates[0][2]
+
+
 # Elementary stream type classification (ISO/IEC 13818-1 & DVB)
 STREAM_TYPE_CATEGORIES = {
     0x01: "VIDEO",  # MPEG-1 Video
@@ -736,6 +898,7 @@ class Engine:
             return 0
 
         prefix_packets = 0
+        start_off = 0
         if self._buffer and self._locked and len(self._buffer) < 188:
             need = 188 - len(self._buffer)
             if len(data) < need:
@@ -749,7 +912,7 @@ class Engine:
                 prefix_packets = 1
                 if len(data) == need:
                     return 1
-                data = memoryview(data)[need:]
+                start_off = need
             else:
                 del self._buffer[-need:]
 
@@ -757,17 +920,23 @@ class Engine:
         if (
             not self._buffer
             and self._locked
-            and self._seen_video_keyframes
+            and (self._seen_video_keyframes or self._counts["packets"] >= 512)
             and bool(self._current)
-            and len(data) >= 188
-            and data[0] == 0x47
+            and (len(data) - start_off) >= 188
+            and data[start_off] == 0x47
             and not self._drop_eit
             and not self._drop_sdt
             and self._filter_keep_pids is None
             and (_C_TS_LIB is not None or self._hls_seg_boundary_pkts == 0)
         ):
             is_hls = self._is_hls_input
-            buf = data if isinstance(data, bytearray) else (bytearray(data) if (is_hls or _C_TS_LIB is not None) else data)
+            if isinstance(data, bytearray):
+                buf = data
+            elif is_hls or _C_TS_LIB is not None:
+                buf = bytearray(memoryview(data)[start_off:])
+                start_off = 0
+            else:
+                buf = data
             mv = memoryview(buf)
             try:
                 pids = self._pids
@@ -777,11 +946,11 @@ class Engine:
                 max_seg_bytes = self.max_segment_bytes
                 has_outs = bool(self._subscribers or self._output_states)
                 room = max_seg_bytes - len(self._current)
-                run_start = 0
+                run_start = start_off
                 packets = 0
                 limit = len(buf) - 188
                 sync_lost = False
-                pos = 0
+                pos = start_off
 
                 if _C_TS_LIB is not None:
                     c_buf = (ctypes.c_char * len(buf)).from_buffer(buf)
@@ -840,6 +1009,20 @@ class Engine:
                     while pos <= limit:
                         room_limit = min(limit, run_start + room - 188)
                         if bool(self._current) and pos <= room_limit:
+                            elapsed_seg = self._elapsed_segment()
+                            if not self._seen_video_keyframes and elapsed_seg >= self.segment_duration:
+                                if pos > run_start:
+                                    span = pos - run_start
+                                    scanned_pkts = span // 188
+                                    _sync_from_c(scanned_pkts)
+                                    self._counts["packets"] = base_pkts + scanned_pkts
+                                    self._counts["bytes"] += span
+                                    self._current.extend(mv[run_start:pos])
+                                    run_start = pos
+                                    base_pkts = self._counts["packets"]
+                                self._finish_segment()
+                                room = max_seg_bytes - len(self._current)
+                                room_limit = min(limit, run_start + room - 188)
                             skip_kf = 0
                             pcr_pid_arg = self._pcr_pid if self._pcr_pid is not None else -1
                             last_pcr_arg = self._pcr_last if self._pcr_last is not None else -1
@@ -916,8 +1099,12 @@ class Engine:
                             self._buffer.extend(mv[pos:])
                         return prefix_packets + packets
                     data = bytes(mv[pos:])
+                    start_off = 0
             finally:
                 mv.release()
+
+        if start_off > 0:
+            data = memoryview(data)[start_off:]
 
         # Standard zero-copy framing fast path when locked and buffer is empty
         if not self._buffer and self._locked and len(data) >= 188 and _valid_header(data, 0):
@@ -1635,6 +1822,7 @@ class Engine:
         master_url = playlist_url
         active_playlist_url = playlist_url
         seg_failures = OrderedDict()
+        key_cache = OrderedDict()
 
         async def _prefetch_producer():
             nonlocal active_playlist_url, producer_error, prefetch_bytes
@@ -1654,10 +1842,10 @@ class Engine:
                             resp = await client.get(active_playlist_url)
                         resp.raise_for_status()
                         text = resp.text
+                        text_len = len(text)
                         resp_url = str(resp.url)
                         del resp
-                        lines = [line.strip() for line in text.splitlines() if line.strip()]
-                        if not lines or not lines[0].startswith("#EXTM3U"):
+                        if not text or not text.lstrip().startswith("#EXTM3U"):
                             if active_playlist_url != master_url:
                                 active_playlist_url = master_url
                             raise ValueError("Invalid M3U8 playlist response")
@@ -1674,23 +1862,67 @@ class Engine:
                         await asyncio.sleep(0.35)
                         continue
 
-                    if any(line.startswith("#EXT-X-STREAM-INF") for line in lines):
-                        for i, line in enumerate(lines):
-                            if line.startswith("#EXT-X-STREAM-INF") and i + 1 < len(lines):
-                                nxt = lines[i + 1]
-                                if not nxt.startswith("#"):
-                                    active_playlist_url = urljoin(resp_url, nxt)
-                                    break
-                        continue
+                    if "#EXT-X-STREAM-INF" in text[:8192]:
+                        lines = [line.strip() for line in text.splitlines() if line.strip()]
+                        best_url = _select_best_hls_variant(lines, resp_url)
+                        if best_url:
+                            active_playlist_url = best_url
+                            continue
+
+                    # Fast O(1) tail parser for mega DVR playlists (e.g. 9000+ segments / 1.2 MB text)
+                    media_seq = 0
+                    skipped_segs = 0
+                    current_key = None
+                    if text_len > 16384:
+                        head_chunk = text[:4096]
+                        for hline in head_chunk.splitlines():
+                            hs = hline.strip()
+                            if hs.startswith("#EXT-X-TARGETDURATION:"):
+                                try:
+                                    target_duration = max(0.5, float(hs.split(":", 1)[1].strip()))
+                                except ValueError:
+                                    pass
+                            elif hs.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                                try:
+                                    media_seq = int(hs.split(":", 1)[1].strip())
+                                except ValueError:
+                                    pass
+                            elif hs.startswith("#EXT-X-KEY:"):
+                                current_key = _parse_hls_key_tag(hs, resp_url)
+                        tail_pos = text.rfind("#EXTINF:", 0, max(0, text_len - 4096))
+                        if tail_pos == -1:
+                            tail_pos = max(0, text_len - 8192)
+                            nl_pos = text.find("\n", tail_pos)
+                            if nl_pos != -1:
+                                tail_pos = nl_pos + 1
+                        skipped_segs = text.count("#EXTINF:", 0, tail_pos)
+                        last_key_pos = text.rfind("#EXT-X-KEY:", 0, tail_pos)
+                        if last_key_pos != -1:
+                            key_end = text.find("\n", last_key_pos)
+                            kline = text[last_key_pos : (key_end if key_end != -1 else tail_pos)].strip()
+                            current_key = _parse_hls_key_tag(kline, resp_url)
+                        lines = [line.strip() for line in text[tail_pos:].splitlines() if line.strip()]
+                    else:
+                        lines = [line.strip() for line in text.splitlines() if line.strip()]
+                    del text
 
                     seg_entries = []
                     next_dur = None
+                    seg_idx = media_seq + skipped_segs
                     for line in lines:
                         if line.startswith("#EXT-X-TARGETDURATION:"):
                             try:
                                 target_duration = max(0.5, float(line.split(":", 1)[1].strip()))
                             except ValueError:
                                 pass
+                        elif line.startswith("#EXT-X-MEDIA-SEQUENCE:") and skipped_segs == 0:
+                            try:
+                                media_seq = int(line.split(":", 1)[1].strip())
+                                seg_idx = media_seq
+                            except ValueError:
+                                pass
+                        elif line.startswith("#EXT-X-KEY:"):
+                            current_key = _parse_hls_key_tag(line, resp_url)
                         elif line.startswith("#EXTINF:"):
                             raw_dur = line[8:].split(",", 1)[0].strip()
                             try:
@@ -1699,37 +1931,67 @@ class Engine:
                                 next_dur = target_duration
                         elif not line.startswith("#"):
                             seg_url = urljoin(resp_url, line)
-                            seg_entries.append((seg_url, next_dur if next_dur is not None else target_duration))
+                            seg_entries.append((
+                                seg_url,
+                                next_dur if next_dur is not None else target_duration,
+                                seg_idx,
+                                current_key,
+                            ))
+                            seg_idx += 1
                             next_dur = None
 
-                    if first_load and len(seg_entries) > 2:
-                        for old_url, _ in seg_entries[:-2]:
+                    if len(seg_entries) > 8:
+                        seg_entries = seg_entries[-8:]
+
+                    keep_initial = 1 if target_duration >= 4.0 else 2
+                    if first_load and len(seg_entries) > keep_initial:
+                        for old_url, _, _, _ in seg_entries[:-keep_initial]:
                             seen_segments[old_url] = True
                     first_load = False
 
-                    new_entries = [(u, d) for (u, d) in seg_entries if u not in seen_segments]
-                    if len(new_entries) > 3:
-                        for old_url, _ in new_entries[:-2]:
+                    new_entries = [item for item in seg_entries if item[0] not in seen_segments]
+                    max_batch = 1 if target_duration >= 5.0 else 2
+                    if len(new_entries) > max_batch + 1:
+                        for old_url, _, _, _ in new_entries[:-max_batch]:
                             seen_segments[old_url] = True
-                        new_entries = new_entries[-2:]
+                        new_entries = new_entries[-max_batch:]
 
-                    for seg_url, seg_dur in new_entries:
+                    for seg_url, seg_dur, seg_seq, seg_key_info in new_entries:
                         if not self._running:
                             return
                         while len(seen_segments) > 120:
                             seen_segments.popitem(last=False)
                         while len(seg_failures) > 120:
                             seg_failures.popitem(last=False)
+                        decryptor = None
                         try:
+                            if seg_key_info is not None:
+                                key_url, explicit_iv = seg_key_info
+                                key_bytes = key_cache.get(key_url)
+                                if key_bytes is None:
+                                    kresp = await client.get(key_url)
+                                    kresp.raise_for_status()
+                                    key_bytes = bytes(kresp._body or b"")
+                                    if len(key_bytes) == 16:
+                                        key_cache[key_url] = key_bytes
+                                        while len(key_cache) > 16:
+                                            key_cache.popitem(last=False)
+                                if key_bytes and len(key_bytes) == 16:
+                                    iv_bytes = explicit_iv if explicit_iv is not None else int(seg_seq).to_bytes(16, "big")
+                                    decryptor = _HlsAes128Decryptor(key_bytes, iv_bytes)
+
                             async with client.stream("GET", seg_url) as seg_resp:
                                 seg_resp.raise_for_status()
                                 clen = int(seg_resp.headers.get("content-length") or 0)
                                 seg_bps = (clen / seg_dur) if (clen >= 188 and seg_dur > 0) else 0.0
                                 seg_read = 0
                                 first_chunk = True
-                                async for chunk in seg_resp.aiter_bytes(131036):
+                                async for raw_chunk in seg_resp.aiter_bytes(131036):
                                     if not self._running:
                                         return
+                                    if not raw_chunk:
+                                        continue
+                                    chunk = decryptor.update(raw_chunk) if decryptor is not None else raw_chunk
                                     if not chunk:
                                         continue
                                     is_seg_start = first_chunk
@@ -1746,6 +2008,12 @@ class Engine:
                                         return
                                     prefetch_bytes += len(chunk)
                                     await prefetch_queue.put((chunk, seg_dur, seg_bps, is_seg_start))
+                                if decryptor is not None:
+                                    tail_dec = decryptor.finalize()
+                                    if tail_dec and self._running:
+                                        seg_read += len(tail_dec)
+                                        prefetch_bytes += len(tail_dec)
+                                        await prefetch_queue.put((tail_dec, seg_dur, seg_bps, False))
                                 if seg_read >= 188:
                                     seen_segments[seg_url] = True
                                     consecutive_errors = 0
@@ -1767,13 +2035,18 @@ class Engine:
                             if consecutive_errors >= 8:
                                 producer_error = exc
                                 return
+                        finally:
+                            if decryptor is not None:
+                                decryptor.close()
 
-                    if prefetch_bytes < 256 * 1024:
-                        poll_sleep = 0.20
-                    elif new_entries:
-                        poll_sleep = min(0.75, max(0.30, target_duration * 0.22))
+                    if new_entries:
+                        poll_sleep = min(2.5, max(0.35, target_duration * 0.38))
+                    elif text_len > 65536:
+                        poll_sleep = min(1.5, max(0.80, target_duration * 0.25))
+                    elif prefetch_bytes < 256 * 1024:
+                        poll_sleep = 0.25
                     else:
-                        poll_sleep = 0.35
+                        poll_sleep = 0.40
                     await asyncio.sleep(poll_sleep)
             finally:
                 try:
@@ -1782,7 +2055,7 @@ class Engine:
                     pass
 
         producer_task = asyncio.create_task(_prefetch_producer())
-        bootstrap_remaining = 4 * 1024 * 1024  # Fast-fill initial 2 HLS segments from historical segment
+        bootstrap_remaining = 512 * 1024  # Fast-fill initial HLS segment without inflating 5s bitrate window
         slice_bytes = 188 * 174  # 32,712 bytes when live .ts/UDP subscribers exist
         seg_clock = None
         try:
@@ -1798,7 +2071,7 @@ class Engine:
                     self._hls_seg_boundary_pkts = 64
                     self._hls_seg_seen_pids.clear()
 
-                if bootstrap_remaining > 0 and len(self._segments) < 2 and not self._subscribers:
+                if bootstrap_remaining > 0 and len(self._segments) < 1 and not self._subscribers:
                     self.feed(chunk)
                     bootstrap_remaining -= chunk_len
                     del chunk
@@ -1911,11 +2184,14 @@ class Engine:
                 await self._stream_hls_playlist(client, clean_url)
                 return
             switch_to_hls = False
+            target_hls_url = clean_url
             async with client.stream("GET", clean_url) as response:
                 response.raise_for_status()
+                resp_url_str = str(response.url)
                 ctype = response.headers.get("content-type", "").lower()
-                if "mpegurl" in ctype or "m3u" in ctype:
+                if "mpegurl" in ctype or "m3u" in ctype or resp_url_str.lower().split("?", 1)[0].endswith((".m3u8", ".m3u")):
                     switch_to_hls = True
+                    target_hls_url = resp_url_str
                 else:
                     raw_queue: asyncio.Queue = asyncio.Queue(maxsize=32)
                     queued_bytes = 0
@@ -1923,7 +2199,7 @@ class Engine:
                     reader_error = None
 
                     async def _ts_reader():
-                        nonlocal switch_to_hls, queued_bytes, reader_error
+                        nonlocal switch_to_hls, target_hls_url, queued_bytes, reader_error
                         first_chunk = True
                         try:
                             async for chunk in response.aiter_bytes(65424):
@@ -1933,6 +2209,7 @@ class Engine:
                                     first_chunk = False
                                     if chunk.lstrip().startswith(b"#EXTM3U"):
                                         switch_to_hls = True
+                                        target_hls_url = resp_url_str
                                         break
                                 while self._running and queued_bytes >= max_ts_queue_bytes:
                                     await asyncio.sleep(0.02)
@@ -2002,7 +2279,7 @@ class Engine:
                             raw_queue.get_nowait()
                         trim_process_memory()
             if switch_to_hls and self._running:
-                await self._stream_hls_playlist(client, clean_url)
+                await self._stream_hls_playlist(client, target_hls_url)
 
     @staticmethod
     def _udp_address(url):
@@ -2152,9 +2429,6 @@ class _AsyncHttpResponse:
 
         reader = self._reader
         rbuf = getattr(reader, "_buffer", None)
-        transport = self._writer.transport if self._writer is not None else None
-        host = self._pool_key[1] if isinstance(self._pool_key, tuple) and len(self._pool_key) > 1 else ""
-        is_remote = host not in ("127.0.0.1", "localhost", "::1", "")
 
         async def _readexactly_ba(n: int) -> bytearray:
             if rbuf is not None:
@@ -2171,15 +2445,6 @@ class _AsyncHttpResponse:
                             if time.monotonic() > deadline:
                                 raise asyncio.TimeoutError()
                             await reader._wait_for_data("readexactly")
-                        if is_remote and transport is not None and len(rbuf) < n and not reader.at_eof():
-                            try:
-                                transport.pause_reading()
-                                await asyncio.sleep(0.045)
-                            finally:
-                                try:
-                                    transport.resume_reading()
-                                except Exception:
-                                    pass
                 out = bytearray(rbuf[:n])
                 del rbuf[:n]
                 reader._maybe_resume_transport()
@@ -2240,15 +2505,6 @@ class _AsyncHttpResponse:
                     data = await asyncio.wait_for(reader.read(chunk_size), timeout=timeout)
                 if not data:
                     break
-                if is_remote and transport is not None and rbuf is not None and len(rbuf) < chunk_size and not reader.at_eof():
-                    try:
-                        transport.pause_reading()
-                        await asyncio.sleep(0.045)
-                    finally:
-                        try:
-                            transport.resume_reading()
-                        except Exception:
-                            pass
                 yield bytearray(data)
 
     async def aclose(self):
@@ -2323,7 +2579,7 @@ class _AsyncHttpClient:
         )
         return key, reader, writer, False
 
-    async def _send_and_read_headers(self, method: str, url: str):
+    async def _send_and_read_headers(self, method: str, url: str, accept_gzip: bool = False):
         current_url = url
         for _ in range(8):
             parts = urlsplit(current_url)
@@ -2339,7 +2595,12 @@ class _AsyncHttpClient:
 
             req_lines = [f"{method} {path_query} HTTP/1.1", f"Host: {host_hdr}"]
             for k, v in self.headers.items():
-                if k.lower() != "host":
+                kl = k.lower()
+                if kl == "host":
+                    continue
+                if kl == "accept-encoding" and accept_gzip:
+                    req_lines.append("Accept-Encoding: gzip")
+                else:
                     req_lines.append(f"{k}: {v}")
             req_bytes = ("\r\n".join(req_lines) + "\r\n\r\n").encode("latin-1", errors="ignore")
 
@@ -2377,7 +2638,7 @@ class _AsyncHttpClient:
         raise RuntimeError(f"Too many HTTP redirects for {url}")
 
     async def get(self, url: str) -> _AsyncHttpResponse:
-        resp = await self._send_and_read_headers("GET", url)
+        resp = await self._send_and_read_headers("GET", url, accept_gzip=True)
         chunks = []
         try:
             async for chunk in resp.aiter_bytes(65424):

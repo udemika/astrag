@@ -259,6 +259,30 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(self.client.get("/1/index.m3u8").status_code, 200)
         self.assertEqual(self.client.get("/1/segment/segment_7.ts").status_code, 200)
 
+    def test_stream_url_query_preserved_for_admin_and_no_duplicates(self):
+        full_url = "http://31.184.196.172:620/ntv.php?id=5006d4375028edc979000160#pnr=100"
+        with self.client.websocket_connect("/control/event/") as ws:
+            ws.send_json({"scope": "auth", "auth": None})
+            ws.receive_json()
+            self.assertEqual(self.cmd("set-stream", id="-", stream={
+                "id": "boets", "name": "Матч Боец", "type": "spts", "enable": True, "input": [full_url], "output": []
+            }).status_code, 200)
+            ev1 = ws.receive_json()
+            self.assertEqual(ev1["scope"], "set-stream")
+            self.assertEqual(ev1["stream"]["id"], "boets")
+            self.assertEqual(ev1["stream"]["input"][0], full_url)
+            # Edit existing stream and verify no duplicates in make_stream and URL query remains intact
+            self.assertEqual(self.cmd("set-stream", id="boets", stream={
+                "id": "boets", "name": "Матч Боец HD", "type": "spts", "enable": True, "input": [full_url], "output": []
+            }).status_code, 200)
+            ev2 = ws.receive_json()
+            self.assertEqual(ev2["stream"]["input"][0], full_url)
+            loaded = self.cmd("load").json()["make_stream"]
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0]["name"], "Матч Боец HD")
+            self.assertEqual(loaded[0]["input"][0], full_url)
+
 
 if __name__ == "__main__":
     unittest.main()
+

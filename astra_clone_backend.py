@@ -273,14 +273,14 @@ def disk_config():
     return validate_config(config)
 
 
-def redact(value):
+def redact(value, strip_urls=False):
     if isinstance(value, dict):
-        return {k: redact(v) for k, v in value.items()
+        return {k: redact(v, strip_urls=strip_urls) for k, v in value.items()
                 if not any(s in str(k).lower() for s in ("password", "token", "secret", "passwd"))
                 and str(k).lower() not in ("pass", "auth")}
     if isinstance(value, list):
-        return [redact(v) for v in value]
-    if isinstance(value, str) and "://" in value:
+        return [redact(v, strip_urls=strip_urls) for v in value]
+    if strip_urls and isinstance(value, str) and "://" in value:
         parts = urlsplit(value)
         if parts.username is not None or parts.fragment or parts.query:
             return parts._replace(netloc=parts.netloc.rsplit("@", 1)[-1], query="", fragment="").geturl()
@@ -473,7 +473,8 @@ class ServerState:
         await self.sync_extra_ports(candidate)
 
     async def broadcast(self, scope, payload):
-        message = {"scope": scope, **redact(payload)}
+        admin_message = {"scope": scope, **redact(payload, strip_urls=False)}
+        observer_message = None
         for ws, user in list(self.websocket_clients.items()):
             if self.config.get("auth", {}).get("enable") or user.get("login"):
                 login = user.get("login")
@@ -483,8 +484,15 @@ class ServerState:
                         self.websocket_clients.pop(ws, None)
                         await ws.close(code=1008)
                         continue
+            is_admin = user.get("admin", True)
+            if is_admin:
+                msg = admin_message
+            else:
+                if observer_message is None:
+                    observer_message = {"scope": scope, **redact(payload, strip_urls=True)}
+                msg = observer_message
             try:
-                await ws.send_json(message)
+                await ws.send_json(msg)
             except Exception:
                 self.websocket_clients.pop(ws, None)
 
@@ -789,7 +797,7 @@ async def control_api(request: Request):
                 "observer": not user["admin"], "dvb_list": [], "net_list": [],
                 "sessions_count": len(state.sessions), "system": {"cpu_frequency_max": 0, "cpu_frequency_cur": 0}}
     if cmd == "load":
-        return copy.deepcopy(state.config) if user["admin"] else redact(state.config)
+        return copy.deepcopy(state.config) if user["admin"] else redact(state.config, strip_urls=True)
     if cmd == "sessions":
         return {"sessions": session_list()}
     if cmd == "log":
@@ -842,20 +850,26 @@ async def control_api(request: Request):
             event = {"reload": True}
         elif cmd == "set-stream":
             data = object_payload(body, "stream")
-            sid = body.get("id", data.get("id"))
+            req_id = body.get("id")
+            is_remove = bool(data.get("remove", body.get("remove", False)))
+            if is_remove:
+                sid = req_id if req_id not in (None, "", "-") else data.get("id")
+            else:
+                sid = data.get("id") if data.get("id") not in (None, "", "-") else req_id
             if sid in (None, "", "-"):
                 sid = uuid.uuid4().hex[:12]
             if not isinstance(sid, str):
                 raise HTTPException(422, "id must be a string")
+            old_sid = req_id if isinstance(req_id, str) and req_id not in ("", "-") else sid
             data["id"] = sid
-            config["make_stream"] = [s for s in config["make_stream"] if s["id"] != sid]
-            if not data.get("remove", body.get("remove", False)):
+            config["make_stream"] = [s for s in config["make_stream"] if s["id"] not in (sid, old_sid)]
+            if not is_remove:
                 config["make_stream"].append(data)
                 state.add_log("info", f"Stream '{data.get('name', sid)}' ({sid}) saved")
             else:
                 data["remove"] = True
                 state.add_log("warning", f"Stream '{sid}' removed")
-            event = {"id": sid, "stream": data}
+            event = {"id": old_sid, "stream": data}
             result["id"] = sid
         elif cmd == "set-stream-input":
             sid = body.get("id")
@@ -985,13 +999,21 @@ async def control_api(request: Request):
                 else:
                     values.append(data)
             else:
-                sid = uuid.uuid4().hex[:12] if sid in (None, "-") else str(sid)
+                req_id = body.get("id")
+                is_remove = bool(data.get("remove", body.get("remove", False)))
+                if is_remove:
+                    sid = req_id if req_id not in (None, "", "-") else data.get("id")
+                else:
+                    sid = data.get("id") if data.get("id") not in (None, "", "-") else req_id
+                sid = uuid.uuid4().hex[:12] if sid in (None, "", "-") else str(sid)
+                old_sid = str(req_id) if req_id not in (None, "", "-") else sid
                 data["id"] = sid
-                values[:] = [v for v in values if v.get("id") != sid]
-                if data.get("remove", body.get("remove", False)):
+                values[:] = [v for v in values if v.get("id") not in (sid, old_sid)]
+                if is_remove:
                     data["remove"] = True
                 else:
                     values.append(data)
+                event["id"] = old_sid
             event[name] = data
             if name in ("adapter", "softcam", "cas"):
                 result["configuration_only"] = True

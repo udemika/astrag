@@ -3346,18 +3346,22 @@ function Host(hostConfig, callback) {
                     if (location.host == host) {
                         authFormInit()
                         if (!token) return
+                        loadError = $.err({
+                            title: self.name,
+                            text: text,
+                            delay: -1,
+                        })
                     } else {
                         var idx = app.hosts[location.host].config.servers.indexOf(hostConfig)
-                        text +=
-                            '<br/><a href="#/settings-servers/' +
-                            idx +
-                            '">Check streamer configuration</a>'
+                        loadError = $.err({
+                            title: self.name,
+                            text: 'Authentication failed. Check streamer Login / Password.',
+                            delay: -1,
+                        }).button('Check configuration', function () {
+                            $.route('#/settings-servers/' + idx)
+                            this.remove()
+                        })
                     }
-                    loadError = $.err({
-                        title: self.name,
-                        text: text,
-                        delay: -1,
-                    })
                 } else {
                     loadError = $.err({
                         title: self.name,
@@ -9177,6 +9181,9 @@ $(function () {
         form.input('Password', '$maskPass')
             .on('focus', function () {
                 self.scope.set('$maskPass', self.scope.get('pass') || '')
+            })
+            .on('input', function () {
+                self.scope.set('pass', this.value)
             })
             .on('blur', function () {
                 self.scope.set('pass', this.value)

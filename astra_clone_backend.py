@@ -277,7 +277,7 @@ def redact(value, strip_urls=False):
     if isinstance(value, dict):
         return {k: redact(v, strip_urls=strip_urls) for k, v in value.items()
                 if not any(s in str(k).lower() for s in ("password", "token", "secret", "passwd"))
-                and str(k).lower() not in ("pass", "auth")}
+                and (not strip_urls or str(k).lower() not in ("pass", "auth"))}
     if isinstance(value, list):
         return [redact(v, strip_urls=strip_urls) for v in value]
     if strip_urls and isinstance(value, str) and "://" in value:

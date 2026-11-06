@@ -1460,6 +1460,7 @@ async def play_stream(stream_id: str, request: Request):
                     return
 
             burst_fn = getattr(engine, "bootstrap_burst", None)
+            gop_burst_fn = getattr(engine, "gop_preroll_burst", None)
             kf_fn = getattr(engine, "is_video_keyframe_packet", None)
             elem_pids = getattr(engine, "_elementary_pids", {}) or {}
             wait_for_kf = bool(getattr(engine, "_seen_video_keyframes", False) and callable(kf_fn))
@@ -1467,14 +1468,21 @@ async def play_stream(stream_id: str, request: Request):
             audio_synced = set()
             burst_sent = False
 
-            if not wait_for_kf:
+            if callable(gop_burst_fn):
+                gop_burst = gop_burst_fn()
+                if gop_burst:
+                    yield gop_burst
+                    burst_sent = True
+                    audio_synced = set(audio_pids)
+
+            if not burst_sent and not wait_for_kf:
                 if callable(burst_fn):
                     burst = burst_fn()
                     if burst:
                         yield burst
                 burst_sent = True
 
-            kf_deadline = time.monotonic() + 1.2
+            kf_deadline = time.monotonic() + 2.5
             skipped_packets = 0
             synth_fn = getattr(engine, "_synth_psi_prefix", None)
             batches_since_psi = 0
@@ -1485,7 +1493,7 @@ async def play_stream(stream_id: str, request: Request):
                     break
 
                 if not burst_sent:
-                    if kf_fn(first) or time.monotonic() >= kf_deadline or skipped_packets >= 4500:
+                    if kf_fn(first) or time.monotonic() >= kf_deadline or skipped_packets >= 9000:
                         burst_sent = True
                         if callable(burst_fn):
                             burst = burst_fn()

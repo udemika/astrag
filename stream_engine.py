@@ -772,6 +772,11 @@ class Engine:
         self._c_out_cc = (ctypes.c_int8 * 8192)(*([-1] * 8192))
         self._c_pid_pkts = (ctypes.c_uint32 * 8192)()
         self._c_last_pos = (ctypes.c_int32 * 8192)(*([-1] * 8192))
+        self._c_has_audio = ctypes.c_int(0)
+        self._c_pcr_val = ctypes.c_int64(-1)
+        self._c_pcr_pos = ctypes.c_int(-1)
+        self._c_synced = False
+        self._c_psi_locked = False
         self._br_history = []
         self._active_input_id = 1
         self._active_url_opts = {}
@@ -979,9 +984,9 @@ class Engine:
                     c_out_cc = self._c_out_cc
                     c_pid_pkts = self._c_pid_pkts
                     c_last_pos = self._c_last_pos
-                    c_has_audio = ctypes.c_int(0)
-                    c_pcr_val = ctypes.c_int64(-1)
-                    c_pcr_pos = ctypes.c_int(-1)
+                    c_has_audio = self._c_has_audio
+                    c_pcr_val = self._c_pcr_val
+                    c_pcr_pos = self._c_pcr_pos
                     seg_seen = self._hls_seg_seen_pids
                     now_ts = self._clock() if self._clock is time.monotonic else 0.0
                     psi_locked = (
@@ -1009,8 +1014,10 @@ class Engine:
                                 c_last_pos[p] = -1
                             else:
                                 c_pid_flags[p] = 0
+                        self._c_synced = not seg_resync
+                        self._c_psi_locked = psi_locked
 
-                    def _sync_from_c(scanned_pkts: int):
+                    def _sync_from_c(scanned_pkts: int, copy_last_pkt: bool = False):
                         seg_resync = is_hls and self._hls_seg_boundary_pkts > 0
                         for p, st in pids.items():
                             if c_pid_flags[p]:
@@ -1024,14 +1031,19 @@ class Engine:
                                     occ = int(c_out_cc[p])
                                     if occ >= 0:
                                         out_cc_map[p] = occ
-                                elif not is_hls and c_last_pos[p] >= 0:
+                                elif copy_last_pkt and not is_hls and c_last_pos[p] >= 0:
                                     lp = int(c_last_pos[p])
                                     st["packet"] = bytes(mv[lp:lp + 188])
                                     c_last_pos[p] = -1
                         if seg_resync and scanned_pkts > 0:
                             self._hls_seg_boundary_pkts = max(0, self._hls_seg_boundary_pkts - scanned_pkts)
+                            if self._hls_seg_boundary_pkts == 0:
+                                self._c_synced = False
 
-                    _sync_to_c()
+                    if not self._c_synced or psi_locked != self._c_psi_locked or (is_hls and self._hls_seg_boundary_pkts > 0):
+                        if self._c_synced:
+                            _sync_from_c(0, False)
+                        _sync_to_c()
                     base_pkts = self._counts["packets"]
 
                     while pos <= limit:
@@ -1042,7 +1054,7 @@ class Engine:
                                 if pos > run_start:
                                     span = pos - run_start
                                     scanned_pkts = span // 188
-                                    _sync_from_c(scanned_pkts)
+                                    _sync_from_c(scanned_pkts, False)
                                     self._counts["packets"] = base_pkts + scanned_pkts
                                     self._counts["bytes"] += span
                                     self._current.extend(mv[run_start:pos])
@@ -1102,7 +1114,7 @@ class Engine:
                         if pos > run_start:
                             span = pos - run_start
                             scanned_pkts = span // 188
-                            _sync_from_c(scanned_pkts)
+                            _sync_from_c(scanned_pkts, True)
                             self._counts["packets"] = base_pkts + scanned_pkts
                             self._counts["bytes"] += span
                             if hls_active:
@@ -1111,6 +1123,7 @@ class Engine:
                         if not _valid_header(buf, pos):
                             self._counts["sync_losses"] += 1
                             self._locked = False
+                            self._c_synced = False
                             sync_lost = True
                             break
 
@@ -1136,7 +1149,8 @@ class Engine:
                         if pos > run_start:
                             span = pos - run_start
                             scanned_pkts = span // 188
-                            _sync_from_c(scanned_pkts)
+                            if not self._c_synced or self._clock is not time.monotonic or (is_hls and self._hls_seg_boundary_pkts > 0):
+                                _sync_from_c(scanned_pkts, self._clock is not time.monotonic)
                             self._counts["packets"] = base_pkts + scanned_pkts
                             self._counts["bytes"] += span
                             if hls_active:
@@ -1207,6 +1221,7 @@ class Engine:
         return prefix_packets + packets
 
     def _packet(self, packet):
+        self._c_synced = False
         self._counts["packets"] += 1
         self._counts["bytes"] += 188
         if self._hls_seg_boundary_pkts > 0:
@@ -1817,6 +1832,13 @@ class Engine:
                "hls_bytes": self._segment_bytes + len(self._current),
                "last_error": self._last_error}
         if include_pids:
+            if self._c_synced:
+                for p, st in self._pids.items():
+                    if self._c_pid_flags[p]:
+                        icc = int(self._c_in_cc[p])
+                        if icc >= 0:
+                            st["cc"] = icc
+                        st["packets"] = int(self._c_pid_pkts[p])
             out["pids"] = {pid: {k: v for k, v in state.items() if k != "packet"}
                            for pid, state in self._pids.items()}
         return out
@@ -1835,6 +1857,7 @@ class Engine:
                 # A failed source cannot leave half a packet/section for its successor.
                 self._buffer.clear()
                 self._locked = False
+                self._c_synced = False
                 for state in self._pids.values():
                     state["cc"] = None
                     state["packet"] = None
@@ -2049,7 +2072,8 @@ class Engine:
                                 seg_bps = (clen / seg_dur) if (clen >= 188 and seg_dur > 0) else 0.0
                                 seg_read = 0
                                 first_chunk = True
-                                async for raw_chunk in seg_resp.aiter_bytes(131036):
+                                read_chunk_sz = 131036 if (self._subscribers or self._output_states) else 262072
+                                async for raw_chunk in seg_resp.aiter_bytes(read_chunk_sz):
                                     if not self._running:
                                         return
                                     if not raw_chunk:
@@ -2066,7 +2090,7 @@ class Engine:
                                         break
                                     seg_read += len(chunk)
                                     while self._running and prefetch_bytes >= max_prefetch_bytes:
-                                        await asyncio.sleep(0.04)
+                                        await asyncio.sleep(0.20)
                                     if not self._running:
                                         return
                                     prefetch_bytes += len(chunk)
@@ -2138,7 +2162,6 @@ class Engine:
                     self.feed(chunk)
                     bootstrap_remaining -= chunk_len
                     del chunk
-                    await asyncio.sleep(0)
                     continue
                 bootstrap_remaining = 0
 
@@ -2170,7 +2193,6 @@ class Engine:
                         await asyncio.sleep(wait)
                     elif wait < -0.30:
                         seg_clock = time.monotonic() - 0.10
-                        await asyncio.sleep(0)
                     continue
 
                 mv_chunk = memoryview(chunk)
@@ -2255,54 +2277,31 @@ class Engine:
                     switch_to_hls = True
                     target_hls_url = resp_url_str
                 else:
-                    raw_queue: asyncio.Queue = asyncio.Queue(maxsize=32)
-                    queued_bytes = 0
-                    max_ts_queue_bytes = 2 * 1024 * 1024
-                    reader_error = None
-
-                    async def _ts_reader():
-                        nonlocal switch_to_hls, target_hls_url, queued_bytes, reader_error
-                        first_chunk = True
-                        try:
-                            async for chunk in response.aiter_bytes(65424):
-                                if not self._running or not chunk:
-                                    break
-                                if first_chunk:
-                                    first_chunk = False
-                                    if chunk.lstrip().startswith(b"#EXTM3U"):
-                                        switch_to_hls = True
-                                        target_hls_url = resp_url_str
-                                        break
-                                while self._running and queued_bytes >= max_ts_queue_bytes:
-                                    await asyncio.sleep(0.02)
-                                queued_bytes += len(chunk)
-                                await raw_queue.put(chunk)
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception as exc:
-                            reader_error = exc
-                        finally:
-                            try:
-                                raw_queue.put_nowait(None)
-                            except asyncio.QueueFull:
-                                pass
-
-                    reader_task = asyncio.create_task(_ts_reader())
+                    first_chunk = True
                     slice_size = 188 * 174
                     ts_clock = time.monotonic()
+                    rbuf = getattr(getattr(response, "_reader", None), "_buffer", None)
                     try:
-                        while self._running:
-                            chunk = await raw_queue.get()
-                            if chunk is None:
+                        ts_read_sz = 131036 if (self._subscribers or self._output_states) else 262072
+                        async for chunk in response.aiter_bytes(ts_read_sz):
+                            if not self._running or not chunk:
                                 break
-                            queued_bytes = max(0, queued_bytes - len(chunk))
-                            if queued_bytes <= 65536 and len(chunk) <= 65536:
+                            if first_chunk:
+                                first_chunk = False
+                                if chunk.lstrip().startswith(b"#EXTM3U"):
+                                    switch_to_hls = True
+                                    target_hls_url = resp_url_str
+                                    break
+                            rem_sock = len(rbuf) if rbuf is not None else 0
+                            if not self._subscribers and not self._output_states:
                                 self.feed(chunk)
                                 del chunk
                                 ts_clock = time.monotonic()
-                                await asyncio.sleep(0)
+                            elif rem_sock <= 65536 and len(chunk) <= 65536:
+                                self.feed(chunk)
+                                del chunk
+                                ts_clock = time.monotonic()
                             else:
-                                # Smooth bursty HTTP .ts upstream sources using 27MHz PCR deltas
                                 mv_chunk = memoryview(chunk)
                                 try:
                                     pos = 0
@@ -2316,29 +2315,19 @@ class Engine:
                                         self.feed(mv_chunk[pos:pos + step])
                                         pos += step
                                         pcr_delta = self._timeline - t_pcr0
-                                        rem_buffered = queued_bytes + (total - pos)
+                                        rem_buffered = (len(rbuf) if rbuf is not None else 0) + (total - pos)
                                         if rem_buffered > 32768 and 0.0 < pcr_delta <= 0.30:
                                             factor = 0.85 if rem_buffered > 512 * 1024 else 0.96
                                             ts_clock += pcr_delta * factor
                                             wait = ts_clock - time.monotonic()
-                                            if wait > 0.002:
+                                            if wait > 0.004:
                                                 await asyncio.sleep(wait)
-                                            else:
-                                                if wait < -0.20:
-                                                    ts_clock = time.monotonic() - 0.20
-                                                await asyncio.sleep(0)
-                                        else:
-                                            await asyncio.sleep(0)
+                                            elif wait < -0.20:
+                                                ts_clock = time.monotonic() - 0.20
                                 finally:
                                     mv_chunk.release()
                                     del chunk
-                        if reader_error is not None:
-                            raise reader_error
                     finally:
-                        reader_task.cancel()
-                        await asyncio.gather(reader_task, return_exceptions=True)
-                        while not raw_queue.empty():
-                            raw_queue.get_nowait()
                         trim_process_memory()
             if switch_to_hls and self._running:
                 await self._stream_hls_playlist(client, target_hls_url)
@@ -2491,107 +2480,216 @@ class _AsyncHttpResponse:
 
         reader = self._reader
         rbuf = getattr(reader, "_buffer", None)
+        tr = getattr(self._writer, "_transport", None) or getattr(self._writer, "transport", None)
+        ssl_proto = getattr(tr, "_ssl_protocol", None) if tr is not None else None
+        raw_tr = getattr(ssl_proto, "_transport", None) if ssl_proto is not None else tr
+        coalesce_paused = False
+        last_pause_ts = 0.0
+        coalesce_window = 0.095 if chunk_size >= 262072 else 0.045
+        loop = asyncio.get_running_loop()
+        watchdog_deadline = time.monotonic() + timeout
+        watchdog_handle = None
 
-        async def _readexactly_ba(n: int) -> bytearray:
-            if rbuf is not None:
-                if len(rbuf) < n:
-                    deadline = time.monotonic() + timeout
-                    while len(rbuf) < n:
-                        if reader.at_eof():
-                            partial = bytes(rbuf)
-                            rbuf.clear()
-                            raise asyncio.IncompleteReadError(partial, n)
-                        if not rbuf:
-                            await asyncio.wait_for(reader._wait_for_data("readexactly"), timeout=timeout)
-                        else:
-                            if time.monotonic() > deadline:
-                                raise asyncio.TimeoutError()
-                            await reader._wait_for_data("readexactly")
-                out = bytearray(rbuf[:n])
-                del rbuf[:n]
-                reader._maybe_resume_transport()
-                return out
-            return bytearray(await asyncio.wait_for(reader.readexactly(n), timeout=timeout))
+        def _check_watchdog():
+            nonlocal watchdog_handle
+            watchdog_handle = None
+            if self._closed or reader is None or reader.at_eof():
+                return
+            now_m = time.monotonic()
+            if now_m >= watchdog_deadline:
+                waiter = getattr(reader, "_waiter", None)
+                if waiter is not None and not waiter.done():
+                    waiter.set_exception(asyncio.TimeoutError())
+            else:
+                watchdog_handle = loop.call_later(max(1.0, watchdog_deadline - now_m), _check_watchdog)
 
-        async def _readuntil(sep: bytes) -> bytes:
-            if rbuf is not None and sep in rbuf:
-                return await reader.readuntil(sep)
-            return await asyncio.wait_for(reader.readuntil(sep), timeout=timeout)
+        if rbuf is not None:
+            watchdog_handle = loop.call_later(timeout, _check_watchdog)
 
-        if "chunked" in te:
-            buf = bytearray()
-            while True:
-                line = await _readuntil(b"\r\n")
-                size_str = line[:-2].split(b";", 1)[0].strip()
-                size = int(size_str, 16)
-                if size == 0:
-                    while True:
-                        tr = await _readuntil(b"\r\n")
-                        if tr in (b"\r\n", b"\n", b""):
+        def _pause_raw():
+            nonlocal coalesce_paused, last_pause_ts
+            if raw_tr is not None and not coalesce_paused and not getattr(raw_tr, "_closing", False):
+                if not getattr(raw_tr, "_paused", False):
+                    try:
+                        raw_tr.pause_reading()
+                        coalesce_paused = True
+                        last_pause_ts = time.monotonic()
+                    except Exception:
+                        pass
+
+        def _resume_raw():
+            nonlocal coalesce_paused
+            if coalesce_paused and raw_tr is not None:
+                coalesce_paused = False
+                if not getattr(ssl_proto, "_ssl_reading_paused", False):
+                    try:
+                        raw_tr.resume_reading()
+                    except Exception:
+                        pass
+
+        async def _wait_coalesced(min_bytes: int):
+            nonlocal watchdog_deadline
+            if rbuf is None or len(rbuf) >= min_bytes or reader.at_eof():
+                return
+            if min_bytes > 16384 and raw_tr is not None:
+                _pause_raw()
+                if coalesce_paused:
+                    wait_s = coalesce_window - (time.monotonic() - last_pause_ts)
+                    if wait_s > 0.004:
+                        await asyncio.sleep(wait_s)
+                _resume_raw()
+            if len(rbuf) < min_bytes and not reader.at_eof():
+                watchdog_deadline = time.monotonic() + timeout
+                await reader._wait_for_data("read")
+            if min_bytes > 16384 and not reader.at_eof():
+                _pause_raw()
+
+        try:
+            if "chunked" in te and rbuf is not None:
+                buf = bytearray()
+                rem_chunk = 0
+                need_crlf = False
+                eof_chunked = False
+                while not eof_chunked:
+                    pos = 0
+                    rlen = len(rbuf)
+                    if rlen > 0:
+                        mv_r = memoryview(rbuf)
+                        try:
+                            while pos < rlen:
+                                if need_crlf:
+                                    if rlen - pos < 2:
+                                        break
+                                    pos += 2
+                                    need_crlf = False
+                                    continue
+                                if rem_chunk > 0:
+                                    take_c = min(rem_chunk, rlen - pos)
+                                    buf.extend(mv_r[pos:pos + take_c])
+                                    pos += take_c
+                                    rem_chunk -= take_c
+                                    if rem_chunk == 0:
+                                        if rlen - pos >= 2:
+                                            pos += 2
+                                        else:
+                                            need_crlf = True
+                                            break
+                                    continue
+                                nl = rbuf.find(b"\r\n", pos)
+                                if nl == -1:
+                                    break
+                                size_str = bytes(mv_r[pos:nl]).split(b";", 1)[0].strip()
+                                pos = nl + 2
+                                size = int(size_str, 16)
+                                if size == 0:
+                                    tr_end = rbuf.find(b"\r\n", pos)
+                                    if tr_end != -1:
+                                        pos = tr_end + 2
+                                    eof_chunked = True
+                                    self._reusable = can_keepalive
+                                    break
+                                avail = rlen - pos
+                                if avail >= size + 2:
+                                    buf.extend(mv_r[pos:pos + size])
+                                    pos += size + 2
+                                elif avail >= size:
+                                    buf.extend(mv_r[pos:pos + size])
+                                    pos += size
+                                    need_crlf = True
+                                    break
+                                else:
+                                    if avail > 0:
+                                        buf.extend(mv_r[pos:rlen])
+                                    rem_chunk = size - avail
+                                    pos = rlen
+                                    break
+                        finally:
+                            mv_r.release()
+                        if pos > 0:
+                            del rbuf[:pos]
+                            if not coalesce_paused:
+                                reader._maybe_resume_transport()
+                    while len(buf) >= chunk_size:
+                        take = (len(buf) // 188) * 188 if (len(buf) >= 188 and buf[0] == 0x47) else chunk_size
+                        if take <= 0:
                             break
-                    self._reusable = can_keepalive
-                    if buf:
-                        yield buf
-                    break
-                rem = size
+                        out = buf[:take]
+                        del buf[:take]
+                        yield out
+                    if eof_chunked:
+                        _resume_raw()
+                        if buf:
+                            yield buf
+                        break
+                    if reader.at_eof() and pos == 0:
+                        _resume_raw()
+                        if buf:
+                            yield buf
+                        break
+                    await _wait_coalesced(32712)
+            elif clen_str is not None and clen_str.strip().isdigit():
+                rem = int(clen_str.strip())
                 while rem > 0:
-                    step = min(chunk_size, rem)
-                    data = await _readexactly_ba(step)
-                    rem -= len(data)
-                    if data:
-                        buf.extend(data)
-                        if len(buf) >= chunk_size:
-                            take = (len(buf) // 188) * 188 if (len(buf) >= 188 and buf[0] == 0x47) else len(buf)
-                            if take > 0:
-                                out = bytearray(buf[:take])
-                                del buf[:take]
-                                yield out
-                await _readexactly_ba(2)
-        elif clen_str is not None and clen_str.strip().isdigit():
-            rem = int(clen_str.strip())
-            while rem > 0:
-                step = min(chunk_size, rem)
-                try:
-                    data = await _readexactly_ba(step)
-                except asyncio.IncompleteReadError as exc:
-                    if exc.partial:
-                        yield bytearray(exc.partial)
-                    can_keepalive = False
-                    break
-                rem -= len(data)
-                yield data
-            if rem == 0:
-                self._reusable = can_keepalive
-        else:
-            first_stream_read = True
-            target_min = min(chunk_size, 188 * 174)  # 32,712 bytes (174 TS packets) coalesced read
-            while True:
-                if rbuf is not None:
-                    while len(rbuf) < target_min and not reader.at_eof():
-                        if first_stream_read and rbuf and rbuf.lstrip().startswith(b"#EXTM3U"):
+                    if rbuf is not None:
+                        want = min(chunk_size, rem)
+                        if len(rbuf) < min(want, 65424) and len(rbuf) < rem and not reader.at_eof():
+                            await _wait_coalesced(min(want, 65424))
+                        if not rbuf and reader.at_eof():
+                            can_keepalive = False
                             break
                         if not rbuf:
-                            await asyncio.wait_for(reader._wait_for_data("read"), timeout=timeout)
-                        else:
-                            try:
-                                await asyncio.wait_for(reader._wait_for_data("read"), timeout=0.05)
-                            except asyncio.TimeoutError:
-                                break
-                    first_stream_read = False
-                    if not rbuf:
-                        break
-                    take = min(len(rbuf), chunk_size)
-                    if take >= 188 and not reader.at_eof() and rbuf[0] == 0x47:
-                        take = (take // 188) * 188
-                    out = bytearray(rbuf[:take])
-                    del rbuf[:take]
-                    reader._maybe_resume_transport()
-                    yield out
-                else:
-                    data = await asyncio.wait_for(reader.read(chunk_size), timeout=timeout)
-                    if not data:
-                        break
-                    yield bytearray(data)
+                            continue
+                        take = min(len(rbuf), chunk_size, rem)
+                        if take >= 188 and take < rem and not reader.at_eof() and rbuf[0] == 0x47:
+                            take = (take // 188) * 188
+                        out = rbuf[:take]
+                        del rbuf[:take]
+                        if not coalesce_paused:
+                            reader._maybe_resume_transport()
+                        rem -= len(out)
+                        if rem == 0:
+                            _resume_raw()
+                        yield out
+                    else:
+                        step = min(chunk_size, rem)
+                        data = await asyncio.wait_for(reader.read(step), timeout=timeout)
+                        if not data:
+                            can_keepalive = False
+                            break
+                        rem -= len(data)
+                        yield bytearray(data)
+                if rem == 0:
+                    self._reusable = can_keepalive
+            else:
+                first_stream_read = True
+                target_min = min(chunk_size, 188 * 174)  # 32,712 bytes (174 TS packets) coalesced read
+                while True:
+                    if rbuf is not None:
+                        if len(rbuf) < target_min and not reader.at_eof():
+                            if not (first_stream_read and rbuf and rbuf.lstrip().startswith(b"#EXTM3U")):
+                                await _wait_coalesced(target_min)
+                        first_stream_read = False
+                        if not rbuf and reader.at_eof():
+                            break
+                        if not rbuf:
+                            continue
+                        take = min(len(rbuf), chunk_size)
+                        if take >= 188 and not reader.at_eof() and rbuf[0] == 0x47:
+                            take = (take // 188) * 188
+                        out = rbuf[:take]
+                        del rbuf[:take]
+                        if not coalesce_paused:
+                            reader._maybe_resume_transport()
+                        yield out
+                    else:
+                        data = await asyncio.wait_for(reader.read(chunk_size), timeout=timeout)
+                        if not data:
+                            break
+                        yield bytearray(data)
+        finally:
+            if watchdog_handle is not None:
+                watchdog_handle.cancel()
+            _resume_raw()
 
     async def aclose(self):
         if self._closed:
@@ -2599,6 +2697,14 @@ class _AsyncHttpResponse:
         self._closed = True
         if self._reader is None or self._writer is None:
             return
+        tr = getattr(self._writer, "_transport", None) or getattr(self._writer, "transport", None)
+        ssl_proto = getattr(tr, "_ssl_protocol", None) if tr is not None else None
+        raw_tr = getattr(ssl_proto, "_transport", None) if ssl_proto is not None else tr
+        if raw_tr is not None and getattr(raw_tr, "_paused", False) and not getattr(ssl_proto, "_ssl_reading_paused", False):
+            try:
+                raw_tr.resume_reading()
+            except Exception:
+                pass
         if getattr(self, "_reusable", False) and not self._writer.is_closing() and not self._reader.at_eof():
             self._client._return_connection(self._pool_key, self._reader, self._writer)
         else:
@@ -2613,6 +2719,11 @@ class _AsyncHttpResponse:
         await self.aclose()
 
 
+_SHARED_SSL_CTX = None
+_SHARED_IO_BUF = bytearray(524288)
+_SHARED_IO_MV = memoryview(_SHARED_IO_BUF)
+
+
 class _AsyncHttpClient:
     """Zero-dependency asyncio HTTP/1.1 + HTTPS client with keep-alive socket pooling."""
 
@@ -2621,21 +2732,22 @@ class _AsyncHttpClient:
         self.read_timeout = read_timeout
         self.headers = dict(headers or {})
         self._pool = {}
-        self._ssl_ctx = None
 
-    def _get_ssl_context(self):
-        if self._ssl_ctx is None:
+    @staticmethod
+    def _get_ssl_context():
+        global _SHARED_SSL_CTX
+        if _SHARED_SSL_CTX is None:
             import ssl
-            ctx = ssl.create_default_context()
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
-            self._ssl_ctx = ctx
-        return self._ssl_ctx
+            _SHARED_SSL_CTX = ctx
+        return _SHARED_SSL_CTX
 
     @staticmethod
     def _close_writer(writer):
         try:
-            tr = getattr(writer, "transport", None)
+            tr = getattr(writer, "_transport", None) or getattr(writer, "transport", None)
             if tr is not None and hasattr(tr, "abort"):
                 tr.abort()
             else:
@@ -2643,14 +2755,30 @@ class _AsyncHttpClient:
         except Exception:
             pass
 
+    def _sweep_closed_pool(self):
+        for k in list(self._pool.keys()):
+            b = self._pool[k]
+            alive = []
+            for r, w in b:
+                if w.is_closing() or r.at_eof():
+                    self._close_writer(w)
+                else:
+                    alive.append((r, w))
+            if alive:
+                self._pool[k] = alive
+            else:
+                del self._pool[k]
+
     def _return_connection(self, key, reader, writer):
+        self._sweep_closed_pool()
         bucket = self._pool.setdefault(key, [])
-        while len(bucket) >= 4:
+        while len(bucket) >= 2:
             _, old_w = bucket.pop(0)
             self._close_writer(old_w)
         bucket.append((reader, writer))
 
     async def _open_or_reuse(self, scheme: str, host: str, port: int):
+        self._sweep_closed_pool()
         key = (scheme, host, port)
         bucket = self._pool.get(key)
         while bucket:
@@ -2660,9 +2788,27 @@ class _AsyncHttpClient:
             self._close_writer(writer)
         ssl_ctx = self._get_ssl_context() if scheme == "https" else None
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port, ssl=ssl_ctx, limit=256 * 1024),
+            asyncio.open_connection(host, port, ssl=ssl_ctx, limit=1024 * 1024),
             timeout=self.connect_timeout,
         )
+        sock = writer.get_extra_info("socket")
+        if sock is not None:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+            except OSError:
+                pass
+        tr = getattr(writer, "_transport", None) or getattr(writer, "transport", None)
+        ssl_proto = getattr(tr, "_ssl_protocol", None) if tr is not None else None
+        if ssl_proto is not None and hasattr(ssl_proto, "_app_protocol_is_buffer"):
+            ssl_proto._app_protocol_get_buffer = lambda sz: _SHARED_IO_MV
+            ssl_proto._app_protocol_buffer_updated = lambda nbytes: reader.feed_data(_SHARED_IO_MV[:nbytes])
+            ssl_proto._app_protocol_is_buffer = True
+        elif tr is not None and hasattr(tr, "_read_ready__get_buffer"):
+            proto = getattr(tr, "_protocol", None)
+            if proto is not None:
+                proto.get_buffer = lambda sz: _SHARED_IO_MV
+                proto.buffer_updated = lambda nbytes: reader.feed_data(_SHARED_IO_MV[:nbytes])
+                tr._read_ready_cb = tr._read_ready__get_buffer
         return key, reader, writer, False
 
     async def _send_and_read_headers(self, method: str, url: str, accept_gzip: bool = False):

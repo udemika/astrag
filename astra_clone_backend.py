@@ -1431,6 +1431,11 @@ async def play_stream(stream_id: str, request: Request):
         queue = await maybe_await(sub_fn(4096) if len(sig.parameters) >= 1 else sub_fn())
     except (ValueError, TypeError):
         queue = await maybe_await(sub_fn())
+    if getattr(engine, "_recent_chunks", None):
+        try:
+            setattr(queue, "_batch_ok", True)
+        except Exception:
+            pass
     sid = state.next_session
     state.next_session += 1
     state.sessions[sid] = {
@@ -1448,7 +1453,7 @@ async def play_stream(stream_id: str, request: Request):
 
     async def generate():
         try:
-            # Drain any packets queued prior to generator startup so there is zero overlap
+            # Drain any packets queued prior to generator startup synchronously before gop_preroll_burst
             while not queue.empty():
                 stale = queue.get_nowait()
                 if hasattr(queue, "task_done"):
@@ -1471,9 +1476,13 @@ async def play_stream(stream_id: str, request: Request):
             if callable(gop_burst_fn):
                 gop_burst = gop_burst_fn()
                 if gop_burst:
-                    yield gop_burst
                     burst_sent = True
                     audio_synced = set(audio_pids)
+                    try:
+                        setattr(queue, "_batch_ok", True)
+                    except Exception:
+                        pass
+                    yield gop_burst
 
             if not burst_sent and not wait_for_kf:
                 if callable(burst_fn):
@@ -1499,13 +1508,13 @@ async def play_stream(stream_id: str, request: Request):
                     break
 
                 if not burst_sent:
-                    if kf_fn(first) or time.monotonic() >= kf_deadline or skipped_packets >= 9000:
+                    if len(first) > 188 or kf_fn(first) or time.monotonic() >= kf_deadline or skipped_packets >= 9000:
                         burst_sent = True
-                        if len(audio_synced) >= len(audio_pids):
-                            try:
-                                setattr(queue, "_batch_ok", True)
-                            except Exception:
-                                pass
+                        audio_synced = set(audio_pids)
+                        try:
+                            setattr(queue, "_batch_ok", True)
+                        except Exception:
+                            pass
                         if callable(burst_fn):
                             burst = burst_fn()
                             if burst:
@@ -1531,6 +1540,8 @@ async def play_stream(stream_id: str, request: Request):
                                         pass
                             else:
                                 continue
+                    else:
+                        audio_synced = set(audio_pids)
 
                 # Coalesce available packets/chunks in queue into up to 64 KB
                 if not queue.empty() and len(first) < 32712:
@@ -1541,18 +1552,6 @@ async def play_stream(stream_id: str, request: Request):
                         if nxt is None:
                             eos = True
                             break
-                        if audio_pids and len(audio_synced) < len(audio_pids) and len(nxt) == 188:
-                            pid = ((nxt[1] & 0x1F) << 8) | nxt[2]
-                            if pid in audio_pids and pid not in audio_synced:
-                                if nxt[1] & 0x40:
-                                    audio_synced.add(pid)
-                                    if len(audio_synced) >= len(audio_pids):
-                                        try:
-                                            setattr(queue, "_batch_ok", True)
-                                        except Exception:
-                                            pass
-                                else:
-                                    continue
                         buf.extend(nxt)
                     batches_since_psi += 1
                     if batches_since_psi >= 250 and callable(synth_fn) and not getattr(engine, "_tables", None):

@@ -417,6 +417,100 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(key_info[1], (0x3EA49).to_bytes(16, "big"))
 
 
+    def test_c_accel_unaligned_chunk_boundary_zero_cc_errors(self):
+        eng = Engine()
+        pat_packet = packet(pid=0, payload=b"\x00" + pat(100), start=True)
+        pmt_packet = packet(pid=100, payload=b"\x00" + pmt(), start=True)
+        eng.feed(pat_packet + pmt_packet)
+        stream = bytearray()
+        cc_v = 0
+        cc_a = 0
+        for i in range(600):
+            if i % 3 == 0:
+                stream.extend(packet(pid=301, cc=cc_a))
+                cc_a = (cc_a + 1) & 0x0F
+            else:
+                stream.extend(packet(pid=256, cc=cc_v))
+                cc_v = (cc_v + 1) & 0x0F
+        # Split across a non-188 boundary (172 bytes residual, like EVP_DecryptUpdate holdback)
+        split_at = 250 * 188 + 172
+        eng.feed(bytes(stream[:split_at]))
+        eng.feed(bytes(stream[split_at:]))
+        snap = eng.stats()
+        self.assertEqual(snap["continuity_errors"], 0)
+        self.assertEqual(snap["packets"], 602)
+
+    def test_batch_subscriber_delivery(self):
+        async def scenario():
+            eng = Engine()
+            pat_packet = packet(pid=0, payload=b"\x00" + pat(100), start=True)
+            pmt_packet = packet(pid=100, payload=b"\x00" + pmt(), start=True)
+            warmup = b"".join(packet(pid=256, cc=i & 0x0F) for i in range(64))
+            eng.feed(pat_packet + pmt_packet + warmup)
+            q = eng.subscribe(64)
+            setattr(q, "_batch_ok", True)
+            payload = b"".join(packet(pid=256, cc=i & 0x0F) for i in range(50))
+            eng.feed(payload)
+            self.assertEqual(q.qsize(), 1)
+            chunk = q.get_nowait()
+            self.assertEqual(len(chunk), 50 * 188)
+
+        asyncio.run(scenario())
+
+    def test_gop_preroll_burst_does_not_enable_hls_or_clobber_cc(self):
+        eng = Engine()
+        pat_packet = packet(pid=0, payload=b"\x00" + pat(100), start=True)
+        pmt_packet = packet(pid=100, payload=b"\x00" + pmt(), start=True)
+        idr_pes = b"\x00\x00\x01\xe0\x00\x00\x80\x00\x00\x00\x00\x01\x67\x42\x00\x1f\x00\x00\x01\x65"
+        kf0 = packet(pid=256, cc=0, start=True, pcr=int(0.5 * PCR_HZ), payload=idr_pes)
+        eng.feed(pat_packet + pmt_packet + kf0)
+        kf1 = packet(pid=256, cc=1, start=True, pcr=int(1.0 * PCR_HZ), payload=idr_pes)
+        tail = b"".join(packet(pid=256, cc=(2 + i) & 0x0F, start=False) for i in range(20))
+        eng.feed(kf1 + tail)
+        out_cc_before = dict(eng._out_cc)
+        burst = eng.gop_preroll_burst()
+        self.assertGreaterEqual(len(burst), 21 * 188)
+        self.assertFalse(eng._is_hls_active())
+        self.assertEqual(eng._out_cc, out_cc_before)
+
+    def test_live_hls_multi_segment_progression_after_bootstrap(self):
+        eng = Engine(segment_duration=1.0, max_segments=5)
+        eng._is_hls_input = True
+        pat_packet = packet(pid=0, payload=b"\x00" + pat(100), start=True)
+        pmt_packet = packet(pid=100, payload=b"\x00" + pmt(), start=True)
+        idr_pes = b"\x00\x00\x01\xe0\x00\x00\x80\x00\x00\x00\x00\x01\x67\x42\x00\x1f\x00\x00\x01\x65"
+        cc = 0
+        initial = bytearray(pat_packet + pmt_packet)
+        for sec in range(3):
+            initial.extend(packet(pid=256, cc=cc & 0x0F, start=True, pcr=int(sec * 1.0 * PCR_HZ), payload=idr_pes))
+            cc += 1
+            for _ in range(39):
+                initial.extend(packet(pid=256, cc=cc & 0x0F))
+                cc += 1
+        eng.feed(initial)
+        pl0 = eng.hls_playlist()
+        self.assertIn("segment-0.ts", pl0)
+        self.assertIn("segment-1.ts", pl0)
+        # Now feed 3 more seconds of live chunks and verify segment-2, segment-3, segment-4 are produced without stalling
+        for sec in range(3, 7):
+            chunk = bytearray()
+            chunk.extend(packet(pid=256, cc=cc & 0x0F, start=True, pcr=int(sec * 1.1 * PCR_HZ), payload=idr_pes))
+            cc += 1
+            for _ in range(39):
+                chunk.extend(packet(pid=256, cc=cc & 0x0F))
+                cc += 1
+            eng.feed(chunk)
+        pl1 = eng.hls_playlist()
+        self.assertGreaterEqual(eng._sequence, 4)
+        for seq_id in eng._segments:
+            seg_data = eng.get_segment(seq_id)
+            self.assertIsNotNone(seg_data)
+            self.assertEqual(seg_data[0], 0x47)
+            # Every segment must begin with PAT (PID 0)
+            first_pid = ((seg_data[1] & 0x1F) << 8) | seg_data[2]
+            self.assertEqual(first_pid, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -834,8 +834,8 @@ class Engine:
             return
         self._recent_chunks.append((now_ts, chunk_obj))
         self._recent_bytes += clen
-        max_recent = (2048 * 1024) if (self._subscribers or self._output_states) else (1280 * 1024)
-        cutoff = now_ts - 4.5
+        max_recent = (2560 * 1024) if (self._subscribers or self._output_states or self._is_hls_active()) else (1792 * 1024)
+        cutoff = now_ts - 6.0
         while len(self._recent_chunks) > 2 and (self._recent_bytes > max_recent or self._recent_chunks[0][0] < cutoff):
             _, old_c = self._recent_chunks.popleft()
             self._recent_bytes = max(0, self._recent_bytes - len(old_c))
@@ -980,6 +980,8 @@ class Engine:
             self._current_has_keyframe = False
             self._current_has_audio = False
             self._hls_cc.clear()
+        elif hls_active and not self._current and self._locked and not self._buffer and self._clock is time.monotonic:
+            self._ensure_hls_segment_started(is_video_keyframe=True, is_audio=True)
 
         if (
             not self._buffer
@@ -1036,7 +1038,6 @@ class Engine:
                     now_ts = self._clock() if self._clock is time.monotonic else 0.0
                     psi_locked = (
                         self._clock is time.monotonic
-                        and not hls_active
                         and self._parsed_pat is not None
                         and bool(self._parsed_pmts)
                         and now_ts < self._next_psi_check
@@ -1092,10 +1093,20 @@ class Engine:
                     base_pkts = self._counts["packets"]
 
                     while pos <= limit:
+                        if hls_active and not self._current and self._clock is time.monotonic:
+                            if self._c_synced:
+                                _sync_from_c(0, False)
+                            self._ensure_hls_segment_started(is_video_keyframe=True, is_audio=True)
+                            _sync_to_c()
+                            room = max_seg_bytes - len(self._current)
                         room_limit = min(limit, run_start + room - 188) if hls_active else limit
                         if (not hls_active or bool(self._current)) and pos <= room_limit:
                             elapsed_seg = self._elapsed_segment() if hls_active else 0.0
-                            max_seg_dur = (self.segment_duration * 1.65) if self._seen_video_keyframes else self.segment_duration
+                            max_seg_dur = (
+                                (self.segment_duration * 1.25)
+                                if (self._seen_video_keyframes and self._clock is time.monotonic)
+                                else ((self.segment_duration * 1.65) if self._seen_video_keyframes else self.segment_duration)
+                            )
                             if hls_active and elapsed_seg >= max_seg_dur:
                                 if pos > run_start:
                                     span = pos - run_start
@@ -1106,9 +1117,27 @@ class Engine:
                                     self._current.extend(mv[run_start:pos])
                                     run_start = pos
                                     base_pkts = self._counts["packets"]
+                                elif self._c_synced:
+                                    _sync_from_c(0, False)
                                 self._finish_segment()
+                                if self._clock is time.monotonic:
+                                    self._ensure_hls_segment_started(is_video_keyframe=True, is_audio=True)
+                                _sync_to_c()
                                 room = max_seg_bytes - len(self._current)
                                 room_limit = min(limit, run_start + room - 188)
+                                elapsed_seg = 0.0
+
+                            scan_room_limit = room_limit
+                            if hls_active and self._clock is time.monotonic and elapsed_seg >= self.segment_duration * 0.82:
+                                v_pids = {p for p, t in elem_pids.items() if t == "VIDEO"}
+                                if v_pids:
+                                    for scan_p in range(pos, room_limit + 1, 188):
+                                        if mv[scan_p] == 0x47 and (mv[scan_p + 1] & 0x40):
+                                            spid = ((mv[scan_p + 1] & 0x1F) << 8) | mv[scan_p + 2]
+                                            if spid in v_pids and self.is_video_keyframe_packet(bytes(mv[scan_p:scan_p + 188])):
+                                                scan_room_limit = scan_p - 188
+                                                break
+
                             if self._clock is not time.monotonic or not self._seen_video_keyframes:
                                 skip_kf = 0
                             elif not hls_active:
@@ -1121,24 +1150,27 @@ class Engine:
                             last_pcr_arg = self._pcr_last if self._pcr_last is not None else -1
                             c_has_audio.value = 0
                             c_pcr_pos.value = -1
-                            new_pos = _C_TS_LIB.ts_scan_batch(
-                                c_buf,
-                                pos,
-                                limit,
-                                room_limit,
-                                1 if need_cc_rewrite else 0,
-                                skip_kf,
-                                pcr_pid_arg,
-                                last_pcr_arg,
-                                c_pid_flags,
-                                c_in_cc,
-                                c_out_cc,
-                                c_pid_pkts,
-                                c_last_pos,
-                                ctypes.byref(c_has_audio),
-                                ctypes.byref(c_pcr_val),
-                                ctypes.byref(c_pcr_pos),
-                            )
+                            if scan_room_limit >= pos:
+                                new_pos = _C_TS_LIB.ts_scan_batch(
+                                    c_buf,
+                                    pos,
+                                    limit,
+                                    scan_room_limit,
+                                    1 if need_cc_rewrite else 0,
+                                    skip_kf,
+                                    pcr_pid_arg,
+                                    last_pcr_arg,
+                                    c_pid_flags,
+                                    c_in_cc,
+                                    c_out_cc,
+                                    c_pid_pkts,
+                                    c_last_pos,
+                                    ctypes.byref(c_has_audio),
+                                    ctypes.byref(c_pcr_val),
+                                    ctypes.byref(c_pcr_pos),
+                                )
+                            else:
+                                new_pos = pos
                             if new_pos > pos:
                                 if c_has_audio.value:
                                     self._current_has_audio = True
@@ -1182,13 +1214,15 @@ class Engine:
                             sync_lost = True
                             break
 
+                        pkt_orig_pos = pos
                         pkt_bytes = bytes(mv[pos:pos + 188])
                         pos += 188
                         packets += 1
-                        self._packet(pkt_bytes)
+                        pkt_out = self._packet(pkt_bytes)
+                        if need_cc_rewrite and not mv.readonly and pkt_out is not None and len(pkt_out) == 188:
+                            mv[pkt_orig_pos:pkt_orig_pos + 188] = pkt_out
                         if (
                             self._clock is time.monotonic
-                            and not hls_active
                             and self._parsed_pat is not None
                             and bool(self._parsed_pmts)
                             and now_ts >= self._next_psi_check
@@ -1229,6 +1263,7 @@ class Engine:
             pos = 0
             packets = 0
             limit = len(data) - 188
+            rec_buf = bytearray() if self._clock is time.monotonic else None
             while pos <= limit:
                 if not _valid_header(data, pos):
                     self._counts["sync_losses"] += 1
@@ -1237,7 +1272,11 @@ class Engine:
                 packet = bytes(mv[pos:pos + 188])
                 pos += 188
                 packets += 1
-                self._packet(packet)
+                pkt_out = self._packet(packet)
+                if rec_buf is not None and pkt_out is not None:
+                    rec_buf.extend(pkt_out)
+            if rec_buf:
+                self._record_recent(bytes(rec_buf), self._clock())
             if pos == len(data):
                 mv.release()
                 return prefix_packets + packets
@@ -1252,6 +1291,7 @@ class Engine:
         buf = self._buffer
         pos = 0
         packets = 0
+        rec_buf = bytearray() if self._clock is time.monotonic else None
         while len(buf) - pos >= 188:
             valid = _valid_header(buf, pos)
             if valid and not self._locked and len(buf) - pos > 188:
@@ -1269,7 +1309,11 @@ class Engine:
             packet = bytes(buf[pos:pos + 188])
             pos += 188
             packets += 1
-            self._packet(packet)
+            pkt_out = self._packet(packet)
+            if rec_buf is not None and pkt_out is not None:
+                rec_buf.extend(pkt_out)
+        if rec_buf:
+            self._record_recent(bytes(rec_buf), self._clock())
         if pos:
             if pos == len(buf):
                 buf.clear()
@@ -1443,6 +1487,7 @@ class Engine:
         if self._output_states:
             for _, _, queue in self._output_states:
                 self._enqueue(queue, packet, "output_drops")
+        return packet
 
     def is_video_keyframe_packet(self, packet: bytes) -> bool:
         """Return True if packet is the start of a video keyframe (random_access or H.264/HEVC SPS/IDR)."""
@@ -1482,9 +1527,10 @@ class Engine:
             elif delta:
                 pkt_span = max(1, index - (self._pcr_index or 0))
                 inst_br = pkt_span * 188 * 8 * PCR_HZ / delta
-                if self._is_hls_input and (delta > PCR_HZ * 2.5 or inst_br < 100_000):
-                    # Guard against multi-second PCR jumps across skipped/spliced HLS segments
-                    pass
+                if self._is_hls_input and (delta > PCR_HZ * 12.0 or inst_br < 32_000):
+                    # Guard against multi-minute PCR jumps across spliced HLS segments while still advancing timeline
+                    fallback_br = self._pcr_bitrate if (self._pcr_bitrate and 100_000 <= self._pcr_bitrate <= 120_000_000) else 4_000_000.0
+                    self._timeline += min(6.0, (pkt_span * 188 * 8.0) / fallback_br)
                 else:
                     self._timeline += delta / PCR_HZ
                     if self._is_hls_input and self._pcr_bitrate and 100_000 <= self._pcr_bitrate <= 120_000_000:
@@ -1493,7 +1539,7 @@ class Engine:
                         self._pcr_bitrate = inst_br
         self._pcr_last = pcr
         self._pcr_index = index
-        if self._current and self._current_pcr is None:
+        if (self._current or self._is_hls_active()) and self._current_pcr is None:
             self._current_pcr = self._timeline
 
     def _break_timeline(self):
@@ -1638,6 +1684,7 @@ class Engine:
                     "type_name": tname,
                     "descriptors": es_descs,
                 })
+            self._c_synced = False
             self._parsed_pmts[pnr] = {
                 "psi": "pmt",
                 "pnr": pnr,
@@ -1685,19 +1732,59 @@ class Engine:
             return b"".join(packets)
         return self._synth_psi_prefix()
 
+    def _prefix_for_slice(self, slice_data: bytes | bytearray | memoryview) -> bytes:
+        """Build PAT/PMT prefix whose continuity counters seamlessly precede the first matching PIDs in slice_data."""
+        prefix = self._prefix()
+        if not prefix or self._clock is not time.monotonic:
+            return prefix
+        target_pids = set()
+        for p_off in range(0, len(prefix) - 187, 188):
+            p = ((prefix[p_off + 1] & 0x1F) << 8) | prefix[p_off + 2]
+            if p != 0x1FFF:
+                target_pids.add(p)
+        first_cc = {}
+        scan_len = min(len(slice_data) - 187, 188 * 2000)
+        for s_off in range(0, scan_len, 188):
+            if slice_data[s_off] != 0x47:
+                continue
+            p = ((slice_data[s_off + 1] & 0x1F) << 8) | slice_data[s_off + 2]
+            if p in target_pids and p not in first_cc:
+                first_cc[p] = slice_data[s_off + 3] & 0x0F
+                if len(first_cc) >= len(target_pids):
+                    break
+        out = bytearray()
+        occ_state = {}
+        for p_off in range(0, len(prefix) - 187, 188):
+            pkt = prefix[p_off:p_off + 188]
+            p = ((pkt[1] & 0x1F) << 8) | pkt[2]
+            if p == 0x1FFF:
+                out.extend(pkt)
+                continue
+            if p in first_cc:
+                cc = (first_cc[p] - 1) & 0x0F
+                first_cc[p] = (first_cc[p] + 1) & 0x0F
+            else:
+                base_cc = occ_state.get(p, self._out_cc.get(p, (pkt[3] & 0x0F)))
+                cc = base_cc & 0x0F
+                occ_state[p] = (cc + 1) & 0x0F
+            out.extend(pkt[:3])
+            out.append((pkt[3] & 0xF0) | cc)
+            out.extend(pkt[4:])
+        return bytes(out)
+
     def bootstrap_burst(self) -> bytes:
         """Return aligned PAT + PMT PSI tables for immediate demuxer lock without PCR drift."""
         return self._prefix()
 
     def gop_preroll_burst(self) -> bytes:
         """Return keyframe-aligned current GOP (PAT + PMT + IDR keyframe up to live edge) for instant startup."""
-        if (
-            self._current_has_keyframe
-            and 188 <= len(self._current) <= 2 * 1024 * 1024
-            and (len(self._current) % 188) == 0
-        ):
-            return bytes(self._current)
         if not self._recent_chunks:
+            if (
+                self._current_has_keyframe
+                and 188 <= len(self._current) <= 2 * 1024 * 1024
+                and (len(self._current) % 188) == 0
+            ):
+                return bytes(self._current)
             return b""
         # Extract keyframe-aligned tail directly from _recent_chunks without activating HLS or clearing buffer
         tail_chunks = []
@@ -1716,14 +1803,16 @@ class Engine:
         scan_start = max(0, n_len - (1024 * 1024 // 188) * 188)
         min_burst_bytes = 188 * 400  # At least ~75 KB so players/VLC lock instantaneously
         for pos in range(n_len - 188, scan_start - 1, -188):
-            if self.is_video_keyframe_packet(raw[pos:pos + 188]):
-                last_kf = pos
-                if n_len - pos >= min_burst_bytes:
-                    break
+            if (raw[pos + 1] & 0x40) or ((raw[pos + 3] & 0x20) and raw[pos + 4] > 0 and (raw[pos + 5] & 0x40)):
+                if self.is_video_keyframe_packet(raw[pos:pos + 188]):
+                    last_kf = pos
+                    if n_len - pos >= min_burst_bytes:
+                        break
         if last_kf < 0 or (n_len - last_kf) < min_burst_bytes:
             last_kf = max(0, n_len - 188 * 512)
-        prefix = self._prefix()
-        return prefix + raw[last_kf:n_len]
+        body = raw[last_kf:n_len]
+        prefix = self._prefix_for_slice(body)
+        return prefix + body
 
     def psi_summary(self) -> dict:
         """Return full Cesbo Astra Analyzer PSI/SI tables and stream metrics."""
@@ -1769,11 +1858,26 @@ class Engine:
             return max(pcr_el, wall_el)
         return pcr_el if pcr_el > 0.0 else wall_el
 
+    def _ensure_hls_segment_started(self, is_video_keyframe: bool = False, is_audio: bool = False):
+        if self._current:
+            return
+        if self._c_synced:
+            self._flush_c_state()
+        self._current_started = self._clock()
+        self._current_pcr = self._timeline if self._pcr_last is not None else None
+        self._current_has_keyframe = bool(is_video_keyframe)
+        self._current_has_audio = bool(is_audio)
+        prefix = self._prefix()
+        if prefix and len(prefix) + 188 <= self.max_segment_bytes:
+            self._append_hls_raw(prefix)
+
     def _append_hls_raw(self, data: bytes):
         """Append 188-byte TS packets (e.g. PAT/PMT prefix) to self._current with continuous CC."""
         if self._clock is not time.monotonic:
             self._current.extend(data)
             return
+        if self._c_synced:
+            self._flush_c_state()
         is_hls = self._is_hls_input
         for pos in range(0, len(data) - 187, 188):
             pkt = data[pos:pos + 188]
@@ -1831,27 +1935,20 @@ class Engine:
                         self._current_has_audio = False
                         self._hls_cc.clear()
                     else:
-                        audio_ready = (not self._has_audio_pid) or self._current_has_audio or elapsed >= max(self.segment_duration * 1.6, 4.5)
-                        if (is_video_keyframe and elapsed >= self.segment_duration * 0.85 and audio_ready) or (
-                                elapsed >= max(self.segment_duration * 2.2, 7.5)):
+                        audio_ready = (not self._has_audio_pid) or self._current_has_audio or elapsed >= max(self.segment_duration * 1.15, 2.5)
+                        if (is_video_keyframe and elapsed >= self.segment_duration * 0.82 and audio_ready) or (
+                                elapsed >= max(self.segment_duration * 1.35, 3.8)):
                             self._finish_segment()
                 elif elapsed >= self.segment_duration:
                     self._finish_segment()
         if not self._current:
-            self._current_started = self._clock()
-            self._current_pcr = self._timeline if self._pcr_last is not None else None
-            self._current_has_keyframe = bool(is_video_keyframe)
-            self._current_has_audio = bool(is_audio)
-            prefix = self._prefix()
-            # Leave room for actual stream data even with unusually many tables.
-            if len(prefix) + 188 <= self.max_segment_bytes:
-                self._append_hls_raw(prefix)
+            self._ensure_hls_segment_started(is_video_keyframe=bool(is_video_keyframe), is_audio=bool(is_audio))
         else:
             if is_video_keyframe:
                 self._current_has_keyframe = True
             if is_audio:
                 self._current_has_audio = True
-        if self._clock is time.monotonic and (pid in self._psi or pid == 0x1000):
+        if self._clock is time.monotonic and not self._is_hls_input and (pid in self._psi or pid == 0x1000):
             self._append_hls_raw(packet)
         else:
             self._current.extend(packet)
@@ -1884,14 +1981,14 @@ class Engine:
             self._evicted_discontinuities += int(old.discontinuity)
 
     def _bootstrap_hls_from_recent(self):
-        """Instantly materialize 2-3 keyframe-aligned HLS segments and live GOP from recent zero-copy chunks."""
+        """Instantly materialize 2 keyframe-aligned HLS segments and live GOP from recent chunks without clearing buffer."""
         now = self._clock()
         self._hls_last_access = now
+        if self._clock is time.monotonic:
+            self._sub_event.set()
         if self._segments or not self._recent_chunks:
             return
         chunks = list(self._recent_chunks)
-        self._recent_chunks.clear()
-        self._recent_bytes = 0
         raw = bytearray().join(b for _, b in chunks)
         n_len = (len(raw) // 188) * 188
         if n_len < 188 * 32:
@@ -1899,60 +1996,26 @@ class Engine:
         if len(raw) > n_len:
             del raw[n_len:]
 
-        total_span = max(3.5, now - chunks[0][0])
-        if self._pcr_bitrate and self._pcr_bitrate > 100000:
+        pcr_dur = _segment_pcr_duration(raw)
+        if pcr_dur is not None and 0.6 <= pcr_dur <= 20.0:
+            total_span = pcr_dur
+        elif self._pcr_bitrate and self._pcr_bitrate > 100000:
             pcr_span = (n_len * 8.0) / self._pcr_bitrate
-            if 2.0 <= pcr_span <= 20.0:
-                total_span = pcr_span
+            total_span = pcr_span if 0.6 <= pcr_span <= 20.0 else max(2.2, now - chunks[0][0])
+        else:
+            total_span = max(2.2, now - chunks[0][0])
         bps = max(32768.0, n_len / total_span)
 
-        is_hls = self._is_hls_input
         video_pids = {p for p, t in self._elementary_pids.items() if t == "VIDEO"}
         kf_offsets = []
-        if _C_TS_LIB is not None and video_pids:
-            c_buf = (ctypes.c_char * n_len).from_buffer(raw)
-            tmp_flags = (ctypes.c_uint8 * 8192)()
-            tmp_in_cc = (ctypes.c_int8 * 8192)(*([-2] * 8192))
-            tmp_out_cc = (ctypes.c_int8 * 8192)(*([-1] * 8192))
-            tmp_pkts = (ctypes.c_uint32 * 8192)()
-            tmp_last = (ctypes.c_int32 * 8192)(*([-1] * 8192))
-            tmp_audio = ctypes.c_int(0)
-            tmp_pcr_val = ctypes.c_int64(-1)
-            tmp_pcr_pos = ctypes.c_int(-1)
-            for p in self._pids:
-                if p != 0x1FFF:
-                    tmp_flags[p] = 1 | (4 if p in video_pids else 0)
-                    if is_hls and p in self._out_cc:
-                        tmp_out_cc[p] = self._out_cc[p]
-            pos = 0
-            limit = n_len - 188
-            while pos <= limit:
-                new_pos = _C_TS_LIB.ts_scan_batch(
-                    c_buf, pos, limit, limit,
-                    0,
-                    0, -1, -1,
-                    tmp_flags, tmp_in_cc, tmp_out_cc, tmp_pkts, tmp_last,
-                    ctypes.byref(tmp_audio), ctypes.byref(tmp_pcr_val), ctypes.byref(tmp_pcr_pos),
-                )
-                if new_pos > limit:
-                    break
-                pkt = raw[new_pos:new_pos + 188]
-                if self.is_video_keyframe_packet(pkt):
-                    kf_offsets.append(new_pos)
-                pid = ((pkt[1] & 0x1F) << 8) | pkt[2]
-                if pid != 0x1FFF:
-                    tmp_flags[pid] = 1 | (4 if pid in video_pids else 0)
-                    tmp_in_cc[pid] = -2
-                    if is_hls:
-                        afc = (pkt[3] >> 4) & 3
-                        occ = ((int(tmp_out_cc[pid]) + 1) & 0x0F) if (afc & 1) else (int(tmp_out_cc[pid]) if tmp_out_cc[pid] >= 0 else (pkt[3] & 0x0F))
-                        tmp_out_cc[pid] = occ
-                        raw[new_pos + 3] = (pkt[3] & 0xF0) | occ
-                pos = new_pos + 188
-            # Do not overwrite self._out_cc from historical _recent_chunks since feed() already rewrote CCs in-place
-            pass
+        if video_pids:
+            for pos in range(0, n_len - 187, 188):
+                if raw[pos] == 0x47 and ((raw[pos + 1] & 0x40) or ((raw[pos + 3] & 0x20) and raw[pos + 4] > 0 and (raw[pos + 5] & 0x40))):
+                    pid = ((raw[pos + 1] & 0x1F) << 8) | raw[pos + 2]
+                    if pid in video_pids and self.is_video_keyframe_packet(bytes(raw[pos:pos + 188])):
+                        kf_offsets.append(pos)
 
-        min_seg_bytes = max(188 * 120, int(bps * 1.6))
+        min_seg_bytes = max(188 * 80, int(bps * min(1.4, total_span * 0.32)))
         seg_starts = []
         for off in kf_offsets:
             if not seg_starts or (off - seg_starts[-1]) >= min_seg_bytes:
@@ -1970,7 +2033,7 @@ class Engine:
                     seg_starts = [k0, max(k0 + 188, mid), k1]
             elif len(seg_starts) == 1:
                 k0 = seg_starts[0]
-                if k0 >= int(bps * 1.2) and (n_len - k0) >= int(bps * 1.2):
+                if k0 >= int(bps * 0.8) and (n_len - k0) >= int(bps * 0.8):
                     mid_tail = k0 + ((((n_len - k0) * 2 // 3) // 188) * 188)
                     seg_starts = [0, k0, max(k0 + 188, min(n_len - 188 * 16, mid_tail))]
                 else:
@@ -1981,8 +2044,9 @@ class Engine:
                 s1 = ((n_len * 2 // 5) // 188) * 188
                 s2 = ((n_len * 4 // 5) // 188) * 188
                 seg_starts = [0, max(188, s1), max(376, s2)]
+        elif len(seg_starts) > 3:
+            seg_starts = seg_starts[-3:]
 
-        prefix = self._prefix()
         mv_raw = memoryview(raw)
         try:
             for idx in range(len(seg_starts) - 1):
@@ -1990,21 +2054,26 @@ class Engine:
                 e_off = seg_starts[idx + 1]
                 if e_off <= s_off:
                     continue
-                seg_dur = max(1.2, (e_off - s_off) / bps)
-                self._current = bytearray()
-                if len(prefix) + 188 <= self.max_segment_bytes:
-                    self._append_hls_raw(prefix)
-                self._current.extend(mv_raw[s_off:e_off])
-                segment = Segment(self._sequence, bytes(self._current), seg_dur, False)
+                slice_mv = mv_raw[s_off:e_off]
+                seg_pcr_d = _segment_pcr_duration(slice_mv)
+                seg_dur = seg_pcr_d if (seg_pcr_d is not None and 0.4 <= seg_pcr_d <= 12.0) else max(0.8, (e_off - s_off) / bps)
+                prefix_s = self._prefix_for_slice(slice_mv)
+                seg_data = (prefix_s + bytes(slice_mv)) if (len(prefix_s) + len(slice_mv) <= self.max_segment_bytes) else bytes(slice_mv)
+                segment = Segment(self._sequence, seg_data, seg_dur, False)
                 self._segments[self._sequence] = segment
                 self._sequence += 1
                 self._segment_bytes += len(segment.data)
             last_off = seg_starts[-1]
-            cur_dur = max(1.0, min(self.segment_duration * 0.80, (n_len - last_off) / bps))
-            self._current = bytearray()
-            if len(prefix) + 188 <= self.max_segment_bytes:
-                self._append_hls_raw(prefix)
-            self._current.extend(mv_raw[last_off:n_len])
+            tail_mv = mv_raw[last_off:n_len]
+            tail_pcr_d = _segment_pcr_duration(tail_mv)
+            cur_dur = (
+                tail_pcr_d
+                if (tail_pcr_d is not None and 0.2 <= tail_pcr_d <= self.segment_duration)
+                else max(0.3, min(self.segment_duration * 0.75, (n_len - last_off) / bps))
+            )
+            prefix_t = self._prefix_for_slice(tail_mv)
+            self._current = bytearray(prefix_t) if (len(prefix_t) + len(tail_mv) <= self.max_segment_bytes) else bytearray()
+            self._current.extend(tail_mv)
             self._current_started = now - cur_dur
             self._current_pcr = (self._timeline - cur_dur) if self._pcr_last is not None else None
             self._current_has_keyframe = True
@@ -2017,6 +2086,8 @@ class Engine:
     async def wait_for_hls(self, timeout: float = 4.0) -> bool:
         """Wait for complete keyframe-aligned HLS segments to be ready."""
         self._hls_last_access = self._clock()
+        if self._clock is time.monotonic:
+            self._sub_event.set()
         if len(self._segments) < 2 and self._recent_chunks:
             self._bootstrap_hls_from_recent()
         if len(self._segments) >= 2:
@@ -2031,11 +2102,15 @@ class Engine:
             await asyncio.sleep(0.04)
         if not self._segments and len(self._current) >= 188 * 16:
             self._finish_segment()
+            if self._clock is time.monotonic:
+                self._ensure_hls_segment_started(is_video_keyframe=True, is_audio=True)
         return bool(self._segments)
 
     def hls_playlist(self):
         """Return an M3U8 string with relative segment-<sequence>.ts URIs."""
         self._hls_last_access = self._clock()
+        if self._clock is time.monotonic:
+            self._sub_event.set()
         if not self._segments and self._recent_chunks:
             self._bootstrap_hls_from_recent()
         first = next(iter(self._segments), self._sequence)
@@ -2318,7 +2393,7 @@ class Engine:
                     if len(seg_entries) > 8:
                         seg_entries = seg_entries[-8:]
 
-                    keep_initial = 2 if target_duration >= 4.0 else 3
+                    keep_initial = 3 if target_duration <= 6.0 else 2
                     if first_load and len(seg_entries) > keep_initial:
                         for old_url, _, old_seq, _ in seg_entries[:-keep_initial]:
                             seen_segments[_seg_dedup_key(old_url)] = True
@@ -2331,7 +2406,7 @@ class Engine:
                         if _seg_dedup_key(item[0]) not in seen_segments
                         and (media_seq == 0 or item[2] > last_completed_seq)
                     ]
-                    max_batch = 2 if target_duration >= 5.0 else 3
+                    max_batch = 3 if target_duration <= 6.0 else 2
                     if len(new_entries) > max_batch:
                         for old_url, _, old_seq, _ in new_entries[:-max_batch]:
                             seen_segments[_seg_dedup_key(old_url)] = True
@@ -2343,7 +2418,7 @@ class Engine:
                     for idx_in_batch, (seg_url, seg_dur, seg_seq, seg_key_info) in enumerate(new_entries):
                         if not self._running:
                             return
-                        if idx_in_batch > 0 and (time.monotonic() - batch_started) >= max(3.0, target_duration * 0.85):
+                        if idx_in_batch > 0 and prefetch_bytes >= 1536 * 1024 and (time.monotonic() - batch_started) >= max(3.5, target_duration * 0.90):
                             break
                         dedup_k = _seg_dedup_key(seg_url)
                         while len(seen_segments) > 160:
@@ -2380,10 +2455,10 @@ class Engine:
                                     break
                                 seg_resp.raise_for_status()
                                 clen = int(seg_resp.headers.get("content-length") or 0)
-                                seg_bps = (clen / seg_dur) if (clen >= 188 and seg_dur > 0) else 0.0
+                                seg_bps = (clen / seg_dur) if (clen >= 188 and seg_dur > 0) else avg_seg_bps
                                 seg_read = 0
                                 first_chunk = True
-                                read_chunk_sz = 131036 if (self._subscribers or self._output_states) else 524144
+                                read_chunk_sz = 131036 if (self._subscribers or self._output_states or self._is_hls_active()) else 524144
                                 async for raw_chunk in seg_resp.aiter_bytes(read_chunk_sz):
                                     if not self._running:
                                         return
@@ -2419,6 +2494,9 @@ class Engine:
                                         prefetch_bytes += len(tail_dec)
                                         await prefetch_queue.put((tail_dec, seg_dur, seg_bps, False))
                                 if seg_read >= 188:
+                                    if seg_dur > 0:
+                                        m_bps = seg_read / seg_dur
+                                        avg_seg_bps = (0.70 * avg_seg_bps + 0.30 * m_bps) if avg_seg_bps > 0 else m_bps
                                     seen_segments[dedup_k] = True
                                     if media_seq > 0 and seg_seq > last_completed_seq:
                                         last_completed_seq = seg_seq
@@ -2448,11 +2526,14 @@ class Engine:
 
                     batch_elapsed = time.monotonic() - batch_started
                     if new_entries:
-                        poll_sleep = max(0.20, min(2.2, target_duration * 0.45 - batch_elapsed * 0.5))
+                        if prefetch_bytes < 512 * 1024:
+                            poll_sleep = 0.20
+                        else:
+                            poll_sleep = max(0.25, min(1.6, target_duration * 0.40 - batch_elapsed * 0.5))
                     elif text_len > 65536:
-                        poll_sleep = min(1.8, max(0.75, target_duration * 0.25))
+                        poll_sleep = min(1.2, max(0.50, target_duration * 0.22))
                     else:
-                        poll_sleep = min(2.2, max(0.40, target_duration * 0.28))
+                        poll_sleep = min(1.0, max(0.35, target_duration * 0.20))
                     await asyncio.sleep(poll_sleep)
             finally:
                 try:
@@ -2460,9 +2541,10 @@ class Engine:
                 except asyncio.QueueFull:
                     pass
 
+        avg_seg_bps = 0.0
         producer_task = asyncio.create_task(_prefetch_producer())
-        bootstrap_remaining = 768 * 1024  # Fast-fill initial buffer from the 2 prefetched initial segments
-        slice_bytes = 188 * 174  # 32,712 bytes when live .ts/UDP subscribers exist
+        bootstrap_remaining = 262144  # Fast-fill initial 256 KB to lock PSI/keyframe while keeping 2 segments in prefetch cushion
+        slice_bytes = 188 * 174  # 32,712 bytes when live .ts/UDP/HLS subscribers exist
         seg_clock = None
         try:
             while self._running:
@@ -2481,46 +2563,43 @@ class Engine:
                     self._hls_seg_boundary_pkts = 64
                     self._hls_seg_seen_pids.clear()
 
-                if bootstrap_remaining > 0 and not self._subscribers:
+                has_viewers = bool(self._subscribers or self._output_states or self._is_hls_active())
+                if bootstrap_remaining > 0 and not has_viewers:
                     self.feed(chunk)
                     bootstrap_remaining -= chunk_len
                     del chunk
                     continue
                 bootstrap_remaining = 0
 
-                if not self._subscribers and not self._output_states:
+                eff_bps = seg_bps if seg_bps > 0 else (
+                    avg_seg_bps if avg_seg_bps > 0 else (
+                        (self._pcr_bitrate / 8.0) if (self._pcr_bitrate and self._pcr_bitrate > 100000) else (384 * 1024 / max(1.0, seg_dur / 4.0))
+                    )
+                )
+
+                if not has_viewers:
                     now = time.monotonic()
                     if seg_clock is None or now > seg_clock + 0.30:
                         seg_clock = now
-                    t_pcr_before = self._timeline
                     self.feed(chunk)
                     del chunk
-                    pcr_delta = self._timeline - t_pcr_before
-                    if seg_bps > 0:
-                        est_dur = chunk_len / seg_bps
-                        if 0.05 <= pcr_delta <= est_dur * 1.45:
-                            slice_dur = pcr_delta
-                        else:
-                            slice_dur = est_dur
-                    elif 0.0 < pcr_delta <= 1.50:
-                        slice_dur = pcr_delta
-                    elif self._pcr_bitrate and self._pcr_bitrate > 100000:
-                        slice_dur = (chunk_len * 8.0) / self._pcr_bitrate
+                    slice_dur = chunk_len / max(32768.0, eff_bps)
+                    buf_sec = prefetch_bytes / max(65536.0, eff_bps)
+                    if prefetch_bytes > 3072 * 1024 or buf_sec > 6.5:
+                        pace_factor = 0.93
+                    elif prefetch_bytes > 2048 * 1024 or buf_sec > 4.2:
+                        pace_factor = 0.98
+                    elif buf_sec >= 1.4 or prefetch_bytes >= 512 * 1024:
+                        pace_factor = 1.000
+                    elif buf_sec >= 0.6:
+                        pace_factor = 1.03
                     else:
-                        slice_dur = (chunk_len / (384 * 1024)) * max(0.8, seg_dur / 4.0)
-                    if prefetch_bytes > 3072 * 1024:
-                        pace_factor = 0.92
-                    elif prefetch_bytes > 2048 * 1024:
-                        pace_factor = 0.97
-                    elif prefetch_bytes >= 384 * 1024:
-                        pace_factor = 0.998
-                    else:
-                        pace_factor = 1.015
+                        pace_factor = 1.07
                     seg_clock += slice_dur * pace_factor
                     wait = seg_clock - time.monotonic()
                     if wait < -0.30:
                         seg_clock = time.monotonic() - 0.10
-                    if wait >= 0.045 and self._running and not self._subscribers and not self._output_states:
+                    if wait >= 0.045 and self._running and not (self._subscribers or self._output_states or self._is_hls_active()):
                         try:
                             await asyncio.wait_for(self._sub_event.wait(), timeout=wait)
                             seg_clock = time.monotonic()
@@ -2537,29 +2616,27 @@ class Engine:
 
                     while pos < chunk_len and self._running:
                         step = min(slice_bytes, chunk_len - pos)
-                        t_pcr_before = self._timeline
                         self.feed(mv_chunk[pos:pos + step])
                         pos += step
-                        pcr_delta = self._timeline - t_pcr_before
-
-                        if 0.0 < pcr_delta <= 1.20:
-                            slice_dur = pcr_delta
-                        elif seg_bps > 0:
-                            slice_dur = step / seg_bps
-                        elif self._pcr_bitrate and self._pcr_bitrate > 100000:
-                            slice_dur = (step * 8.0) / self._pcr_bitrate
+                        rem_in_chunk = chunk_len - pos
+                        total_buf_bytes = prefetch_bytes + rem_in_chunk
+                        cur_bps = seg_bps if seg_bps > 0 else (
+                            avg_seg_bps if avg_seg_bps > 0 else (
+                                (self._pcr_bitrate / 8.0) if (self._pcr_bitrate and self._pcr_bitrate > 100000) else eff_bps
+                            )
+                        )
+                        slice_dur = step / max(32768.0, cur_bps)
+                        buf_sec = total_buf_bytes / max(65536.0, cur_bps)
+                        if total_buf_bytes > 3072 * 1024 or buf_sec > 6.5:
+                            pace_factor = 0.93
+                        elif total_buf_bytes > 2048 * 1024 or buf_sec > 4.2:
+                            pace_factor = 0.98
+                        elif buf_sec >= 1.4 or total_buf_bytes >= 512 * 1024:
+                            pace_factor = 1.000
+                        elif buf_sec >= 0.6:
+                            pace_factor = 1.03
                         else:
-                            slice_dur = (step / (384 * 1024)) * max(0.8, seg_dur / 4.0)
-
-                        # Hardware-grade PLL pacing: keep 1 full segment buffered at 1.0x PCR speed
-                        if prefetch_bytes > 3072 * 1024:
-                            pace_factor = 0.92
-                        elif prefetch_bytes > 2048 * 1024:
-                            pace_factor = 0.97
-                        elif prefetch_bytes >= 384 * 1024:
-                            pace_factor = 0.998
-                        else:
-                            pace_factor = 1.015
+                            pace_factor = 1.07
 
                         seg_clock += slice_dur * pace_factor
                         wait = seg_clock - time.monotonic()
@@ -2613,11 +2690,8 @@ class Engine:
                     target_hls_url = resp_url_str
                 else:
                     first_chunk = True
-                    slice_size = 188 * 174
-                    ts_clock = time.monotonic()
-                    rbuf = getattr(getattr(response, "_reader", None), "_buffer", None)
                     try:
-                        ts_read_sz = 131036 if (self._subscribers or self._output_states) else 262072
+                        ts_read_sz = 65424 if (self._subscribers or self._output_states or self._is_hls_active()) else 262072
                         async for chunk in response.aiter_bytes(ts_read_sz):
                             if not self._running or not chunk:
                                 break
@@ -2627,41 +2701,8 @@ class Engine:
                                     switch_to_hls = True
                                     target_hls_url = resp_url_str
                                     break
-                            rem_sock = len(rbuf) if rbuf is not None else 0
-                            if not self._subscribers and not self._output_states:
-                                self.feed(chunk)
-                                del chunk
-                                ts_clock = time.monotonic()
-                            elif rem_sock <= 65536 and len(chunk) <= 65536:
-                                self.feed(chunk)
-                                del chunk
-                                ts_clock = time.monotonic()
-                            else:
-                                mv_chunk = memoryview(chunk)
-                                try:
-                                    pos = 0
-                                    total = len(chunk)
-                                    now = time.monotonic()
-                                    if now > ts_clock + 0.05:
-                                        ts_clock = now
-                                    while pos < total and self._running:
-                                        step = min(slice_size, total - pos)
-                                        t_pcr0 = self._timeline
-                                        self.feed(mv_chunk[pos:pos + step])
-                                        pos += step
-                                        pcr_delta = self._timeline - t_pcr0
-                                        rem_buffered = (len(rbuf) if rbuf is not None else 0) + (total - pos)
-                                        if rem_buffered > 32768 and 0.0 < pcr_delta <= 0.30:
-                                            factor = 0.85 if rem_buffered > 512 * 1024 else 0.96
-                                            ts_clock += pcr_delta * factor
-                                            wait = ts_clock - time.monotonic()
-                                            if wait > 0.004:
-                                                await asyncio.sleep(wait)
-                                            elif wait < -0.20:
-                                                ts_clock = time.monotonic() - 0.20
-                                finally:
-                                    mv_chunk.release()
-                                    del chunk
+                            self.feed(chunk)
+                            del chunk
                     finally:
                         trim_process_memory()
             if switch_to_hls and self._running:

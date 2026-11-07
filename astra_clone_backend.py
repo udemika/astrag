@@ -1482,6 +1482,12 @@ async def play_stream(stream_id: str, request: Request):
                         yield burst
                 burst_sent = True
 
+            if burst_sent and len(audio_synced) >= len(audio_pids):
+                try:
+                    setattr(queue, "_batch_ok", True)
+                except Exception:
+                    pass
+
             kf_deadline = time.monotonic() + 2.5
             skipped_packets = 0
             synth_fn = getattr(engine, "_synth_psi_prefix", None)
@@ -1495,6 +1501,11 @@ async def play_stream(stream_id: str, request: Request):
                 if not burst_sent:
                     if kf_fn(first) or time.monotonic() >= kf_deadline or skipped_packets >= 9000:
                         burst_sent = True
+                        if len(audio_synced) >= len(audio_pids):
+                            try:
+                                setattr(queue, "_batch_ok", True)
+                            except Exception:
+                                pass
                         if callable(burst_fn):
                             burst = burst_fn()
                             if burst:
@@ -1507,19 +1518,25 @@ async def play_stream(stream_id: str, request: Request):
                         skipped_packets += 1
                     continue
 
-                if audio_pids and len(audio_synced) < len(audio_pids) and len(first) == 188:
-                    pid = ((first[1] & 0x1F) << 8) | first[2]
-                    if pid in audio_pids and pid not in audio_synced:
-                        if first[1] & 0x40:
-                            audio_synced.add(pid)
-                        else:
-                            continue
+                if audio_pids and len(audio_synced) < len(audio_pids):
+                    if len(first) == 188:
+                        pid = ((first[1] & 0x1F) << 8) | first[2]
+                        if pid in audio_pids and pid not in audio_synced:
+                            if first[1] & 0x40:
+                                audio_synced.add(pid)
+                                if len(audio_synced) >= len(audio_pids):
+                                    try:
+                                        setattr(queue, "_batch_ok", True)
+                                    except Exception:
+                                        pass
+                            else:
+                                continue
 
-                # Coalesce available packets in queue into up to 32 KB (174 * 188 = 32712 bytes)
-                if not queue.empty():
+                # Coalesce available packets/chunks in queue into up to 64 KB
+                if not queue.empty() and len(first) < 32712:
                     buf = bytearray(first)
                     eos = False
-                    while len(buf) + 188 <= 32712 and not queue.empty():
+                    while len(buf) < 32712 and not queue.empty():
                         nxt = queue.get_nowait()
                         if nxt is None:
                             eos = True
@@ -1529,6 +1546,11 @@ async def play_stream(stream_id: str, request: Request):
                             if pid in audio_pids and pid not in audio_synced:
                                 if nxt[1] & 0x40:
                                     audio_synced.add(pid)
+                                    if len(audio_synced) >= len(audio_pids):
+                                        try:
+                                            setattr(queue, "_batch_ok", True)
+                                        except Exception:
+                                            pass
                                 else:
                                     continue
                         buf.extend(nxt)
@@ -1889,7 +1911,15 @@ def main() -> int:
     else:
         PORT = args.port
         HOST = args.host
+    import logging
     import uvicorn
+
+    class _SuppressInvalidHttpFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            msg = record.getMessage()
+            return "Invalid HTTP request received" not in msg
+
+    logging.getLogger("uvicorn.error").addFilter(_SuppressInvalidHttpFilter())
     uvicorn.run(app, host=HOST, port=PORT, log_level="warning", access_log=False, loop="asyncio")
     return 0
 

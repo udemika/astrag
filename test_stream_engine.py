@@ -473,8 +473,97 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(eng._is_hls_active())
         self.assertEqual(eng._out_cc, out_cc_before)
 
+    def test_live_hls_multi_segment_progression_after_bootstrap(self):
+        eng = Engine(segment_duration=1.0, max_segments=5)
+        eng._is_hls_input = True
+        pat_packet = packet(pid=0, payload=b"\x00" + pat(100), start=True)
+        pmt_packet = packet(pid=100, payload=b"\x00" + pmt(), start=True)
+        idr_pes = b"\x00\x00\x01\xe0\x00\x00\x80\x00\x00\x00\x00\x01\x67\x42\x00\x1f\x00\x00\x01\x65"
+        cc = 0
+        initial = bytearray(pat_packet + pmt_packet)
+        for sec in range(3):
+            initial.extend(packet(pid=256, cc=cc & 0x0F, start=True, pcr=int(sec * 1.0 * PCR_HZ), payload=idr_pes))
+            cc += 1
+            for _ in range(39):
+                initial.extend(packet(pid=256, cc=cc & 0x0F))
+                cc += 1
+        eng.feed(initial)
+        pl0 = eng.hls_playlist()
+        self.assertIn("segment-0.ts", pl0)
+        self.assertIn("segment-1.ts", pl0)
+        # Now feed 3 more seconds of live chunks and verify segment-2, segment-3, segment-4 are produced without stalling
+        for sec in range(3, 7):
+            chunk = bytearray()
+            chunk.extend(packet(pid=256, cc=cc & 0x0F, start=True, pcr=int(sec * 1.1 * PCR_HZ), payload=idr_pes))
+            cc += 1
+            for _ in range(39):
+                chunk.extend(packet(pid=256, cc=cc & 0x0F))
+                cc += 1
+            eng.feed(chunk)
+        pl1 = eng.hls_playlist()
+        self.assertGreaterEqual(eng._sequence, 4)
+        for seq_id in eng._segments:
+            seg_data = eng.get_segment(seq_id)
+            self.assertIsNotNone(seg_data)
+            self.assertEqual(seg_data[0], 0x47)
+            # Every segment must begin with PAT (PID 0)
+            first_pid = ((seg_data[1] & 0x1F) << 8) | seg_data[2]
+            self.assertEqual(first_pid, 0)
+
+    def test_hls_discontinuity_flag_suppression_and_zero_cc_prebuffer(self):
+        eng = Engine(segment_duration=1.0, max_segments=5)
+        eng._is_hls_input = True
+        pat_packet = packet(pid=0, payload=b"\x00" + pat(100), start=True)
+        pmt_packet = packet(pid=100, payload=b"\x00" + pmt(), start=True)
+        idr_pes = b"\x00\x00\x01\xe0\x00\x00\x80\x00\x00\x00\x00\x01\x67\x42\x00\x1f\x00\x00\x01\x65"
+        cc = 0
+        eng.feed(pat_packet + pmt_packet)
+        for sec in range(4):
+            # Simulate Akamai/CDN upstream HLS segment boundary with discontinuity_indicator=True
+            eng._hls_seg_boundary_pkts = 1024
+            eng._hls_seg_seen_pids.clear()
+            eng._c_synced = False
+            chunk = bytearray()
+            chunk.extend(packet(
+                pid=256,
+                cc=cc & 0x0F,
+                start=True,
+                discontinuity=True,
+                pcr=int(sec * 1.05 * PCR_HZ),
+                payload=idr_pes,
+            ))
+            cc += 1
+            for _ in range(39):
+                chunk.extend(packet(pid=256, cc=cc & 0x0F))
+                cc += 1
+            eng.feed(chunk)
+        pl = eng.hls_playlist()
+        self.assertNotIn("#EXT-X-DISCONTINUITY\n", pl)
+        for seg in eng._segments.values():
+            for off in range(0, len(seg.data) - 187, 188):
+                afc = (seg.data[off + 3] >> 4) & 3
+                if (afc & 2) and seg.data[off + 4] > 0:
+                    self.assertEqual(seg.data[off + 5] & 0x80, 0)
+        q, pre_parts = eng.subscribe_with_prebuffer(64, chunk_mode=True)
+        self.assertTrue(len(pre_parts) >= 1)
+        next_pkt = packet(pid=256, cc=cc & 0x0F)
+        eng.feed(next_pkt)
+        live_chunk = q.get_nowait()
+        combined = b"".join(pre_parts) + live_chunk
+        last_v_cc = None
+        cc_gaps = 0
+        for off in range(0, len(combined) - 187, 188):
+            pid = ((combined[off + 1] & 0x1F) << 8) | combined[off + 2]
+            if pid == 256:
+                cur_cc = combined[off + 3] & 0x0F
+                if last_v_cc is not None and cur_cc != ((last_v_cc + 1) & 0x0F):
+                    cc_gaps += 1
+                last_v_cc = cur_cc
+        self.assertEqual(cc_gaps, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

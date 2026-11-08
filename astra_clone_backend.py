@@ -300,8 +300,8 @@ def make_engine(config):
         outputs=config.get("output", []),
         segment_duration=seg_dur,
         max_segments=max_segs,
-        max_segment_bytes=5 * 1024 * 1024,
-        max_hls_bytes=16 * 1024 * 1024,
+        max_segment_bytes=4 * 1024 * 1024,
+        max_hls_bytes=10 * 1024 * 1024,
         stream_options=config,
     )
 
@@ -1431,7 +1431,7 @@ async def play_stream(stream_id: str, request: Request):
         queue = await maybe_await(sub_fn(4096) if len(sig.parameters) >= 1 else sub_fn())
     except (ValueError, TypeError):
         queue = await maybe_await(sub_fn())
-    if getattr(engine, "_recent_chunks", None):
+    if getattr(engine, "_segments", None) or getattr(engine, "_current", None) or getattr(engine, "_recent_chunks", None):
         try:
             setattr(queue, "_batch_ok", True)
         except Exception:

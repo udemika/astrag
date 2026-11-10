@@ -1002,11 +1002,18 @@ typedef struct psicap {
     int ndone;
 } psicap_t;
 
+typedef struct front front_t;
+typedef struct hls hls_t;
+typedef struct channel channel_t;
+
 typedef struct oseg {
     int ref;
     long long seq;
     double dur;
     int disc;
+    channel_t *ch;
+    uint64_t rfrom, rto;
+    buf_t pre;
     uint8_t *data;
     size_t len;
 } oseg_t;
@@ -1014,13 +1021,11 @@ typedef struct oseg {
 static void oseg_unref(oseg_t *s)
 {
     if (s && --s->ref == 0) {
+        buf_free(&s->pre);
         free(s->data);
         free(s);
     }
 }
-
-typedef struct front front_t;
-typedef struct hls hls_t;
 
 enum { IN_WAIT, IN_TS, IN_HLS };
 
@@ -1069,14 +1074,14 @@ typedef struct channel {
     int nclients;
     front_t *waiters;
     double last_flush;
-    /* HLS out */
+    /* HLS out (zero-copy over ch->ring) */
     int hls_on, cur_started, cur_disc, disc_pending;
     double hls_last_req, cur_t0_wall;
     int64_t cur_t0_pcr;
+    uint64_t cur_rfrom;
     oseg_t *segs[16];
     int nsegs;
     long long next_seq;
-    buf_t cseg;
     /* stats */
     uint64_t win_bytes, packets, cc_err, pes_err, sync_losses;
     double win_start, bitrate;
@@ -1346,41 +1351,10 @@ static int ts_packet(channel_t *ch, uint8_t *p, int hls, int *is_kf)
 
 /* ------------------------------------------------------------ channel ring */
 
-static void ring_resize(channel_t *ch, size_t ncap)
-{
-    ncap = ncap / TS * TS;
-    if (ncap < TS * 64 || ncap == ch->rcap)
-        return;
-    uint8_t *nr = malloc(ncap);
-    if (!nr)
-        return;
-    uint64_t keep = min_sz(ch->wpos, min_sz(ch->rcap, ncap));
-    keep -= keep % TS;
-    for (uint64_t p = ch->wpos - keep; p < ch->wpos;) {
-        size_t so = p % ch->rcap, dso = p % ncap;
-        size_t n = min_sz(min_sz(ch->rcap - so, ncap - dso), ch->wpos - p);
-        memcpy(nr + dso, ch->ring + so, n);
-        p += n;
-    }
-    free(ch->ring);
-    ch->ring = nr;
-    ch->rcap = ncap;
-}
-
 static uint64_t ring_low(channel_t *ch)
 {
     uint64_t room = ch->rcap - 64 * TS;
     return ch->wpos > room ? ch->wpos - room : 0;
-}
-
-static void ring_copy(channel_t *ch, buf_t *dst, uint64_t from, uint64_t to)
-{
-    while (from < to) {
-        size_t o = from % ch->rcap;
-        size_t n = min_sz(ch->rcap - o, to - from);
-        buf_add(dst, ch->ring + o, n);
-        from += n;
-    }
 }
 
 static void prefix_build(channel_t *ch, buf_t *b)
@@ -1396,6 +1370,92 @@ static void prefix_build(channel_t *ch, buf_t *b)
     }
 }
 
+/* Snapshot a zero-copy segment into its own buffer only if the ring is about to overwrite it while still needed. */
+static void oseg_detach(oseg_t *s)
+{
+    if (!s || s->data || !s->ch)
+        return;
+    channel_t *ch = s->ch;
+    uint64_t lo = ring_low(ch);
+    uint64_t from = s->rfrom < lo ? lo : s->rfrom;
+    uint64_t to = s->rto > ch->wpos ? ch->wpos : s->rto;
+    if (to < from)
+        to = from;
+    size_t body_len = (size_t)(to - from);
+    size_t total = s->pre.len + body_len;
+    uint8_t *buf = malloc(total ? total : 1);
+    if (!buf) {
+        s->ch = NULL;
+        s->len = 0;
+        return;
+    }
+    if (s->pre.len)
+        memcpy(buf, s->pre.p, s->pre.len);
+    size_t off = s->pre.len;
+    for (uint64_t p = from; p < to;) {
+        size_t ro = p % ch->rcap;
+        size_t n = min_sz(ch->rcap - ro, (size_t)(to - p));
+        memcpy(buf + off, ch->ring + ro, n);
+        off += n;
+        p += n;
+    }
+    buf_free(&s->pre);
+    s->data = buf;
+    s->len = total;
+    s->ch = NULL;
+}
+
+static void hls_before_ring_overwrite(channel_t *ch, uint64_t new_lo)
+{
+    if (ch->cur_started && ch->cur_rfrom < new_lo) {
+        uint64_t aligned = new_lo + ((TS - (new_lo % TS)) % TS);
+        ch->cur_rfrom = aligned;
+    }
+    int active_hls = (g_now - ch->hls_last_req) <= 60.0;
+    int min_keep = active_hls ? 2 : 1;
+    for (int i = 0; i < ch->nsegs;) {
+        oseg_t *s = ch->segs[i];
+        if (!s->data && s->ch == ch && s->rfrom < new_lo) {
+            if (s->ref > 1 || ch->nsegs <= min_keep) {
+                oseg_detach(s);
+                i++;
+            } else {
+                oseg_unref(s);
+                memmove(ch->segs + i, ch->segs + i + 1, (ch->nsegs - i - 1) * sizeof ch->segs[0]);
+                ch->nsegs--;
+            }
+        } else {
+            i++;
+        }
+    }
+}
+
+static void ring_resize(channel_t *ch, size_t ncap)
+{
+    ncap = ncap / TS * TS;
+    if (ncap < TS * 64 || ncap == ch->rcap)
+        return;
+    uint64_t keep = min_sz(ch->wpos, min_sz(ch->rcap, ncap));
+    keep -= keep % TS;
+    uint64_t new_room = ncap > 64 * TS ? ncap - 64 * TS : 0;
+    uint64_t new_lo = ch->wpos > new_room ? ch->wpos - new_room : 0;
+    if (ch->wpos - keep > new_lo)
+        new_lo = ch->wpos - keep;
+    hls_before_ring_overwrite(ch, new_lo);
+    uint8_t *nr = malloc(ncap);
+    if (!nr)
+        return;
+    for (uint64_t p = ch->wpos - keep; p < ch->wpos;) {
+        size_t so = p % ch->rcap, dso = p % ncap;
+        size_t n = min_sz(min_sz(ch->rcap - so, ncap - dso), ch->wpos - p);
+        memcpy(nr + dso, ch->ring + so, n);
+        p += n;
+    }
+    free(ch->ring);
+    ch->ring = nr;
+    ch->rcap = ncap;
+}
+
 /* ------------------------------------------------------------- HLS output */
 
 static double seg_elapsed(channel_t *ch, int64_t pcr)
@@ -1408,10 +1468,9 @@ static double seg_elapsed(channel_t *ch, int64_t pcr)
     return g_now - ch->cur_t0_wall;
 }
 
-static void seg_begin(channel_t *ch, int64_t pcr, double wall)
+static void seg_begin(channel_t *ch, uint64_t rfrom, int64_t pcr, double wall)
 {
-    ch->cseg.len = 0;
-    prefix_build(ch, &ch->cseg);
+    ch->cur_rfrom = rfrom;
     ch->cur_t0_pcr = pcr;
     ch->cur_t0_wall = wall;
     ch->cur_started = 1;
@@ -1419,9 +1478,11 @@ static void seg_begin(channel_t *ch, int64_t pcr, double wall)
     ch->disc_pending = 0;
 }
 
-static void seg_finish(channel_t *ch, double dur)
+static void seg_finish(channel_t *ch, uint64_t rto, double dur)
 {
-    if (ch->cseg.len < TS * 8)
+    uint64_t lo = ring_low(ch);
+    uint64_t from = ch->cur_rfrom < lo ? lo : ch->cur_rfrom;
+    if (rto <= from || (rto - from) < TS * 8)
         return;
     oseg_t *s = calloc(1, sizeof *s);
     if (!s)
@@ -1430,13 +1491,16 @@ static void seg_finish(channel_t *ch, double dur)
     s->seq = ch->next_seq++;
     s->dur = dur > 0.05 ? dur : ch->seg_target;
     s->disc = ch->cur_disc;
-    s->data = ch->cseg.p;
-    s->len = ch->cseg.len;
-    ch->cseg.p = NULL;
-    ch->cseg.len = ch->cseg.cap = 0;
-    /* Segmenter always runs (like the Python engine) so a new HLS viewer gets a full window at once; idle channels keep 2. */
+    s->ch = ch;
+    s->rfrom = from;
+    s->rto = rto;
+    prefix_build(ch, &s->pre);
+    s->len = s->pre.len + (size_t)(rto - from);
+    /* Zero-copy segmenter references ch->ring directly (0 extra buffer RAM); idle channels keep 2. */
     int keep = g_now - ch->hls_last_req > 60.0 ? 2 : ch->seg_keep;
     while (ch->nsegs > 0 && (ch->nsegs == 16 || ch->nsegs >= keep)) {
+        if (ch->segs[0]->ref > 1)
+            oseg_detach(ch->segs[0]);
         oseg_unref(ch->segs[0]);
         memmove(ch->segs, ch->segs + 1, (ch->nsegs - 1) * sizeof ch->segs[0]);
         ch->nsegs--;
@@ -1446,49 +1510,49 @@ static void seg_finish(channel_t *ch, double dur)
 
 static void hls_out_off(channel_t *ch)
 {
-    for (int i = 0; i < ch->nsegs; i++)
+    for (int i = 0; i < ch->nsegs; i++) {
+        if (ch->segs[i]->ref > 1)
+            oseg_detach(ch->segs[i]);
+        else
+            ch->segs[i]->ch = NULL;
         oseg_unref(ch->segs[i]);
+    }
     ch->nsegs = 0;
-    buf_free(&ch->cseg);
     ch->cur_started = 0;
     ch->hls_on = 0;
 }
 
-static void hls_out_feed(channel_t *ch, const uint8_t *s, size_t o, const size_t *kfo, const int64_t *kfp, int nk)
+static void hls_out_feed(channel_t *ch, uint64_t base, size_t o, const size_t *kfo, const int64_t *kfp, int nk)
 {
     if (!ch->hls_on)
         return;
-    size_t run = 0;
     for (int k = 0; k < nk; k++) {
+        uint64_t kf_pos = base + kfo[k];
         if (!ch->cur_started) {
-            run = kfo[k];
-            seg_begin(ch, kfp[k], g_now);
+            seg_begin(ch, kf_pos, kfp[k], g_now);
             continue;
         }
         double d = seg_elapsed(ch, kfp[k]);
         if (d >= ch->seg_target) {
-            buf_add(&ch->cseg, s + run, kfo[k] - run);
-            seg_finish(ch, d);
-            run = kfo[k];
-            seg_begin(ch, kfp[k], g_now);
+            seg_finish(ch, kf_pos, d);
+            seg_begin(ch, kf_pos, kfp[k], g_now);
         }
     }
     if (!ch->cur_started)
         return;
-    buf_add(&ch->cseg, s + run, o - run);
+    uint64_t end_pos = base + o;
     double d = seg_elapsed(ch, ch->cur_pcr);
-    if (d >= ch->seg_target * 3.0 || ch->cseg.len > 48u * 1024 * 1024) {
-        seg_finish(ch, d);
-        seg_begin(ch, ch->cur_pcr, g_now);
+    if (d >= ch->seg_target * 3.0 || (end_pos - ch->cur_rfrom) > 48u * 1024 * 1024) {
+        seg_finish(ch, end_pos, d);
+        seg_begin(ch, end_pos, ch->cur_pcr, g_now);
     }
 }
 
-/* First HLS request: build one segment from the ring so the playlist is usable immediately. */
+/* First HLS request: build zero-copy segment references from the ring so the playlist is usable immediately. */
 static void hls_out_activate(channel_t *ch)
 {
     ch->hls_on = 1;
     ch->cur_started = 0;
-    ch->cseg.len = 0;
     uint64_t lo = ring_low(ch);
     int newest = -1, oldest = -1;
     for (int i = 0; i < ch->kf_cnt; i++) {
@@ -1502,18 +1566,16 @@ static void hls_out_activate(channel_t *ch)
     if (newest < 0)
         return;
     if (oldest != newest) {
-        seg_begin(ch, ch->kf_pcr[oldest], ch->kf_wall[oldest]);
-        ring_copy(ch, &ch->cseg, ch->kf_pos[oldest], ch->kf_pos[newest]);
+        seg_begin(ch, ch->kf_pos[oldest], ch->kf_pcr[oldest], ch->kf_wall[oldest]);
         double d = -1;
         if (ch->kf_pcr[oldest] >= 0 && ch->kf_pcr[newest] >= 0)
             d = ((ch->kf_pcr[newest] - ch->kf_pcr[oldest] + PCR_WRAP) % PCR_WRAP) / PCR_HZ;
         if (d <= 0 || d > 60)
             d = ch->kf_wall[newest] - ch->kf_wall[oldest];
         if (d >= 0.3)
-            seg_finish(ch, d);
+            seg_finish(ch, ch->kf_pos[newest], d);
     }
-    seg_begin(ch, ch->kf_pcr[newest], ch->kf_wall[newest]);
-    ring_copy(ch, &ch->cseg, ch->kf_pos[newest], ch->wpos);
+    seg_begin(ch, ch->kf_pos[newest], ch->kf_pcr[newest], ch->kf_wall[newest]);
 }
 
 /* --------------------------------------------------------------- TS feed */
@@ -1562,6 +1624,10 @@ static void ts_feed(channel_t *ch, const uint8_t *d, size_t n, int hls)
     if (!o)
         return;
     uint64_t base = ch->wpos;
+    uint64_t new_wpos = base + o;
+    uint64_t room = ch->rcap > 64 * TS ? ch->rcap - 64 * TS : 0;
+    uint64_t new_lo = new_wpos > room ? new_wpos - room : 0;
+    hls_before_ring_overwrite(ch, new_lo);
     size_t w = o > ch->rcap ? ch->rcap : o;
     const uint8_t *src = s + (o - w);
     uint64_t p = base + (o - w);
@@ -1607,7 +1673,7 @@ static void ts_feed(channel_t *ch, const uint8_t *d, size_t n, int hls)
             }
         }
     }
-    hls_out_feed(ch, s, o, kfo, kfp, nk);
+    hls_out_feed(ch, base, o, kfo, kfp, nk);
 }
 
 /* ------------------------------------------------------------ control out */
@@ -1805,15 +1871,37 @@ static void front_flush(front_t *fr)
     if (fr->ev.dead)
         return;
     for (;;) {
-        struct iovec iov[2];
+        struct iovec iov[4];
         int n = 0;
         if (fr->out_off < fr->out.len) {
             iov[n].iov_base = fr->out.p + fr->out_off;
             iov[n++].iov_len = fr->out.len - fr->out_off;
         }
         if (fr->seg && fr->seg_off < fr->seg->len) {
-            iov[n].iov_base = fr->seg->data + fr->seg_off;
-            iov[n++].iov_len = fr->seg->len - fr->seg_off;
+            oseg_t *seg = fr->seg;
+            if (seg->data) {
+                iov[n].iov_base = seg->data + fr->seg_off;
+                iov[n++].iov_len = seg->len - fr->seg_off;
+            } else if (seg->ch) {
+                if (fr->seg_off < seg->pre.len) {
+                    iov[n].iov_base = seg->pre.p + fr->seg_off;
+                    iov[n++].iov_len = seg->pre.len - fr->seg_off;
+                }
+                size_t body_off = fr->seg_off > seg->pre.len ? fr->seg_off - seg->pre.len : 0;
+                uint64_t rpos = seg->rfrom + body_off;
+                if (rpos < seg->rto) {
+                    channel_t *sch = seg->ch;
+                    size_t rem = (size_t)(seg->rto - rpos);
+                    size_t a = rpos % sch->rcap;
+                    size_t first = min_sz(rem, sch->rcap - a);
+                    iov[n].iov_base = sch->ring + a;
+                    iov[n++].iov_len = first;
+                    if (rem > first) {
+                        iov[n].iov_base = sch->ring;
+                        iov[n++].iov_len = rem - first;
+                    }
+                }
+            }
         }
         if (!n)
             break;
@@ -3491,8 +3579,9 @@ static void ch_tick(channel_t *ch, int second)
         if (g_now >= ch->next_resize) {
             ch->next_resize = g_now + 5;
             double bps = fmax(ch->bitrate, ch->pcr_bitrate) / 8;
-            /* Whole GOP + start burst + slack: with 10 s GOPs an 8 s ring held no keyframe old enough. */
-            double secs = fmax(8.0, ch->gop + START_BURST_S + 1.5);
+            /* Whole GOP + start burst + zero-copy HLS window in one single ring buffer. */
+            double hls_secs = (g_now - ch->hls_last_req <= 60.0 ? (ch->seg_keep + 1) : 3) * ch->seg_target + 1.5;
+            double secs = fmax(fmax(8.0, ch->gop + START_BURST_S + 1.5), hls_secs);
             size_t want = (size_t)clampd(bps * secs, 2.0 * 1024 * 1024, 32.0 * 1024 * 1024);
             if (want > ch->rcap * 1.25 || want < ch->rcap * 0.6)
                 ring_resize(ch, want);

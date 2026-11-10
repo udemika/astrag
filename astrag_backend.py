@@ -2130,6 +2130,53 @@ if STATIC_DIR.is_dir():
     app.mount("/", AstraStaticOrStreamApp(directory=str(STATIC_DIR), html=True), name="static")
 
 
+def _cli_remove(argv: list) -> int:
+    import shutil
+    import subprocess
+    if os.geteuid() != 0:
+        print("Ошибка: команда 'astrag remove' требует прав root (используйте sudo).", file=sys.stderr)
+        return 1
+    target_arg = None
+    purge = False
+    for a in argv:
+        if a in ("--purge", "-P", "purge"):
+            purge = True
+        elif not a.startswith("-"):
+            target_arg = a
+    service_name = "astrag" if not target_arg else (
+        "astrag" if target_arg.isdigit() and int(target_arg) == 8000 else (
+            f"astrag{target_arg}" if target_arg.isdigit() else target_arg
+        )
+    )
+    unit_name = f"{service_name}.service"
+    subprocess.run(["systemctl", "stop", unit_name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["systemctl", "disable", unit_name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    Path(f"/etc/systemd/system/{unit_name}").unlink(missing_ok=True)
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "reset-failed"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(f"[AstraG] Сервис '{service_name}' остановлен и удален из systemd.")
+    if purge:
+        if target_arg is not None and service_name != "astrag":
+            conf_p = Path(f"/etc/astrag/{service_name}.conf")
+            conf_p.unlink(missing_ok=True)
+            print(f"[AstraG] Конфигурационный файл {conf_p} удален.")
+        else:
+            for unit_p in Path("/etc/systemd/system").glob("astrag*.service"):
+                subprocess.run(["systemctl", "stop", unit_p.name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["systemctl", "disable", unit_p.name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                unit_p.unlink(missing_ok=True)
+            subprocess.run(["pkill", "-f", "/opt/astrag/astrag-core"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["systemctl", "daemon-reload"], check=False)
+            for d in (Path("/opt/astrag"), Path("/etc/astrag"), Path("/var/lib/astrag"), Path("/var/log/astrag")):
+                if d.exists():
+                    shutil.rmtree(d, ignore_errors=True)
+            subprocess.run(["userdel", "astrag"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for b in (Path("/usr/bin/astrag"), Path("/usr/bin/astra-clone")):
+                b.unlink(missing_ok=True)
+            print("[AstraG] Все файлы (/opt/astrag, /etc/astrag, /var/lib/astrag, /usr/bin/astrag) полностью удалены.")
+    return 0
+
+
 def main() -> int:
     global PORT, HOST, CONFIG_FILE, STATE_FILE
     try:
@@ -2138,11 +2185,26 @@ def main() -> int:
         libc.prctl(15, b"astrag\x00", 0, 0, 0)
     except Exception:
         pass
+    argv = sys.argv[1:]
+    if argv:
+        cmd = argv[0]
+        if cmd in ("-v", "--version", "version"):
+            print("AstraG 2.0.0")
+            return 0
+        if cmd in ("remove", "uninstall"):
+            return _cli_remove(argv[1:])
+        if cmd == "purge":
+            return _cli_remove(["--purge"] + argv[1:])
     parser = argparse.ArgumentParser(description="AstraG media & control server")
     parser.add_argument("-c", "--config", default=str(CONFIG_FILE), help="Configuration file path (default: %(default)s)")
     parser.add_argument("-p", "--port", type=int, default=PORT, help="Primary HTTP/IPTV port (default: %(default)s)")
     parser.add_argument("--host", default=HOST, help="Bind address (default: %(default)s)")
-    args, _ = parser.parse_known_args()
+    args, unknown = parser.parse_known_args()
+    unknown_pos = [u for u in unknown if not u.startswith("-")]
+    if unknown_pos:
+        print(f"[AstraG] Неизвестная команда или аргумент: {' '.join(unknown_pos)}", file=sys.stderr)
+        print("Используйте: astrag init | astrag remove [--purge] | astrag -c /etc/astrag/astrag.conf", file=sys.stderr)
+        return 2
     if args.config:
         CONFIG_FILE = Path(args.config)
         _migrate_legacy_conf_and_state(CONFIG_FILE)
@@ -2159,6 +2221,20 @@ def main() -> int:
     else:
         PORT = args.port
         HOST = args.host
+
+    import socket as _socket
+    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as probe_sock:
+        probe_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        try:
+            probe_sock.bind((HOST if HOST != "0.0.0.0" else "0.0.0.0", int(PORT)))
+        except OSError:
+            print(
+                f"[AstraG] Порт {PORT} уже занят работающим процессом AstraG.\n"
+                f"Для перезапуска работающего сервиса используйте: sudo systemctl restart astrag",
+                file=sys.stderr,
+            )
+            return 1
+
     import logging
     import uvicorn
 

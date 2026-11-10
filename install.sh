@@ -149,6 +149,24 @@ find "$STATIC_DIR" -type f -exec chmod 0644 {} +
 # Remove any legacy /opt/astrag/venv so neither mode uses a persistent virtualenv
 rm -rf "$APP_DIR/venv"
 
+# Native data plane (astrag-core). The backend uses it automatically when /opt/astrag/astrag-core is
+# executable and falls back to the Python engine otherwise.
+install_astrag_core() {
+    if [ "$(uname -m)" = "x86_64" ] && [ -f "$SCRIPT_DIR/astrag-core" ] && "$SCRIPT_DIR/astrag-core" --version >/dev/null 2>&1; then
+        install -o root -g root -m 0755 "$SCRIPT_DIR/astrag-core" "$APP_DIR/astrag-core"
+    elif [ -f "$SCRIPT_DIR/astrag_core.c" ]; then
+        echo "==> Building astrag-core from source..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y gcc libc6-dev libssl-dev >/dev/null 2>&1 || true
+        if gcc -O2 -s -o "$APP_DIR/astrag-core.new" "$SCRIPT_DIR/astrag_core.c" -lssl -lcrypto -lpthread -lm; then
+            chmod 0755 "$APP_DIR/astrag-core.new"
+            mv -f "$APP_DIR/astrag-core.new" "$APP_DIR/astrag-core"
+        else
+            rm -f "$APP_DIR/astrag-core.new"
+            echo "WARNING: astrag-core build failed; the Python stream engine will be used." >&2
+        fi
+    fi
+}
+
 if [ "$INSTALL_MODE" = "apt" ]; then
     echo "==> [Mode 1: APT-Only] Installing Ubuntu system APT packages (zero pip, zero venv)..."
     apt-get update
@@ -178,6 +196,7 @@ if [ "$INSTALL_MODE" = "apt" ]; then
     else
         install -o root -g root -m 0644 "$SCRIPT_DIR/astra_clone_backend.py" "$APP_DIR/astrag_backend.py"
     fi
+    install_astrag_core
 
     EXEC_START_CMD="/usr/bin/python3 /opt/astrag/astra_clone_backend.py"
     cat > /usr/bin/astrag <<'EOF'
@@ -231,6 +250,7 @@ else
     install -o root -g root -m 0755 "$TMP_BUILD/dist/astrag" "$APP_DIR/astrag"
     install -o root -g root -m 0644 "$SCRIPT_DIR/create_admin.py" "$APP_DIR/create_admin.py"
     install -o root -g root -m 0644 "$SCRIPT_DIR/account_security.py" "$APP_DIR/account_security.py"
+    install_astrag_core
     rm -f "$APP_DIR/astra_clone_backend.py" "$APP_DIR/astrag_backend.py" "$APP_DIR/stream_engine.py" "$APP_DIR/requirements.txt"
     rm -rf "$TMP_BUILD"
     TMP_BUILD=""

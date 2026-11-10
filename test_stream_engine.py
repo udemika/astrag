@@ -457,6 +457,38 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
 
         asyncio.run(scenario())
 
+    def test_batch_subscriber_coalesces_python_path_and_keeps_order(self):
+        async def scenario():
+            eng = Engine()
+            q = eng.subscribe(64, chunk_mode=True)
+            pkts = [packet(pid=0, payload=b"\x00" + pat(100), start=True),
+                    packet(pid=100, payload=b"\x00" + pmt(), start=True)]
+            pkts += [packet(pid=256, cc=i & 0x0F) for i in range(10)]
+            eng.feed(b"".join(pkts))
+            got = b""
+            while not q.empty():
+                got += q.get_nowait()
+            self.assertEqual(got, b"".join(pkts))
+            self.assertLessEqual(q.qsize(), 0)
+            self.assertEqual(eng._pending_batch, bytearray())
+
+        asyncio.run(scenario())
+
+    def test_subscriber_queue_is_bounded_by_bytes(self):
+        async def scenario():
+            eng = Engine(max_queue_bytes=188 * 100)
+            q = eng.subscribe(4096, chunk_mode=True)
+            for i in range(50):
+                eng.feed(b"".join(packet(pid=256, cc=(i * 10 + j) & 0x0F) for j in range(10)))
+            self.assertLessEqual(q.queued_bytes, 188 * 100)
+            self.assertEqual(q.queued_bytes, sum(len(x) for x in q._queue))
+            self.assertGreater(eng._counts["queue_drops"], 0)
+            eng.unsubscribe(q)
+            self.assertIs(q.get_nowait(), END_OF_STREAM)
+            self.assertEqual(q.queued_bytes, 0)
+
+        asyncio.run(scenario())
+
     def test_gop_preroll_burst_does_not_enable_hls_or_clobber_cc(self):
         eng = Engine()
         pat_packet = packet(pid=0, payload=b"\x00" + pat(100), start=True)

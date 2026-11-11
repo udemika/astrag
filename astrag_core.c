@@ -3834,6 +3834,12 @@ int main(int argc, char **argv)
     g_ctl_lev.type = EV_CTL_LISTEN;
     g_ctl_lev.fd = cfd;
     ev_watch(&g_ctl_lev, EPOLLIN);
+    prctl(PR_SET_NAME, "astrag", 0, 0, 0);
+    if (argc > 0 && argv[0]) {
+        char *end = argv[argc - 1] + strlen(argv[argc - 1]);
+        if (end > argv[0]) memset(argv[0], 0, (size_t)(end - argv[0]));
+        memcpy(argv[0], "astrag", 6);
+    }
     LOG("started, upstream 127.0.0.1:%d", g_upstream_port);
     double next_sec = g_now + 1.0, next_trim = g_now + 10.0;
     struct epoll_event evs[256];

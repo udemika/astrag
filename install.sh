@@ -200,18 +200,13 @@ if [ "$INSTALL_MODE" = "apt" ]; then
     install_astrag_core
 
     EXEC_START_CMD="/usr/bin/python3 /opt/astrag/astra_clone_backend.py"
-    if [ -f "$SCRIPT_DIR/astrag" ] && head -n 1 "$SCRIPT_DIR/astrag" | grep -q "python"; then
-        rm -f /usr/bin/astrag
-        install -o root -g root -m 0755 "$SCRIPT_DIR/astrag" /usr/bin/astrag
-    else
-        cat > /usr/bin/astrag <<'EOF'
+    cat > /usr/bin/astrag <<'EOF'
 #!/bin/sh
 export MALLOC_MMAP_THRESHOLD_=131072
 export MALLOC_TRIM_THRESHOLD_=131072
 export MALLOC_ARENA_MAX=2
 exec /usr/bin/python3 /opt/astrag/astra_clone_backend.py "$@"
 EOF
-    fi
 
 else
     echo "==> [Mode 2: Single Binary] Compiling AstraG into a standalone binary (/opt/astrag/astrag) like Cesbo Astra..."

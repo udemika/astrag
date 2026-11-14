@@ -279,6 +279,83 @@
         form.submit().addChild(btnApply, btnCancel)
     }
 
+    // On-Demand (Inactive) card reset + Cluster Pass-Through Control/WS Proxy
+    var origEmit = app.emit
+    app.emit = function (scope, event) {
+        if (scope === 'ping') return
+        if (scope === 'stream_event' && event && event.data && event.data.idle) {
+            var node = window.MainModule && MainModule.streams && MainModule.streams[event.host + '/' + event.data.channel_id]
+            if (node && typeof node.reset === 'function') {
+                delete node.lastEvent
+                node.reset()
+            }
+            return
+        }
+        return origEmit.apply(this, arguments)
+    }
+
+    if (window.fetch) {
+        var origFetch = window.fetch
+        window.fetch = function (input, init) {
+            try {
+                var urlStr = typeof input === 'string' ? input : (input && input.url) || ''
+                var m = urlStr.match(/^https?:\/\/([^/]+)\/control\/?$/)
+                if (m && m[1] !== location.host) {
+                    var targetHost = m[1]
+                    var opts = Object.assign({}, init || {})
+                    var origHeaders = opts.headers || {}
+                    var remoteAuth = origHeaders['Authorization'] || origHeaders['authorization'] || ''
+                    var localToken = $.cookie.get('auth')
+                    if (!localToken) {
+                        try { localToken = sessionStorage.getItem('astra_auth') } catch (e) {}
+                    }
+                    var newHeaders = {
+                        'Content-Type': 'application/json',
+                        'X-Cluster-Target': targetHost,
+                    }
+                    if (remoteAuth) newHeaders['X-Cluster-Auth'] = remoteAuth
+                    if (localToken) newHeaders['Authorization'] = 'Basic ' + $.base64Encode(localToken)
+                    opts.headers = newHeaders
+                    return origFetch.call(window, '/api/cluster-control', opts)
+                }
+            } catch (e) {}
+            return origFetch.apply(this, arguments)
+        }
+    }
+
+    if (window.WebSocket) {
+        var OrigWebSocket = window.WebSocket
+        var ProxiedWebSocket = function (url, protocols) {
+            try {
+                var m = String(url).match(/^wss?:\/\/([^/]+)\/control\/event\/?$/)
+                if (m && m[1] !== location.host) {
+                    var wsProto = location.protocol === 'https:' ? 'wss://' : 'ws://'
+                    url = wsProto + location.host + '/api/cluster-ws?host=' + encodeURIComponent(m[1])
+                }
+            } catch (e) {}
+            var ws = protocols !== undefined ? new OrigWebSocket(url, protocols) : new OrigWebSocket(url)
+            var pingTimer = setInterval(function () {
+                try {
+                    if (ws.readyState === OrigWebSocket.OPEN) {
+                        ws.send(JSON.stringify({ scope: 'ping' }))
+                    } else if (ws.readyState === OrigWebSocket.CLOSED || ws.readyState === OrigWebSocket.CLOSING) {
+                        clearInterval(pingTimer)
+                    }
+                } catch (e) {}
+            }, 15000)
+            ws.addEventListener('close', function () {
+                clearInterval(pingTimer)
+            })
+            return ws
+        }
+        ProxiedWebSocket.prototype = OrigWebSocket.prototype
+        ProxiedWebSocket.CONNECTING = OrigWebSocket.CONNECTING
+        ProxiedWebSocket.OPEN = OrigWebSocket.OPEN
+        ProxiedWebSocket.CLOSING = OrigWebSocket.CLOSING
+        ProxiedWebSocket.CLOSED = OrigWebSocket.CLOSED
+        window.WebSocket = ProxiedWebSocket
+    }
+
     SettingsUsersModule.openConfig = function (login) {
         var modalData = {}
         var origLogin = login || ''

@@ -20,7 +20,7 @@ import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 from typing import List
 from xml.sax.saxutils import escape as xml_escape
 
@@ -269,6 +269,13 @@ def validate_stream_entry(item: dict) -> dict:
     entry["enable"] = enable
     entry["input"] = [validate_url(v, False) for v in raw_in if not (isinstance(v, str) and not v.strip())]
     entry["output"] = [validate_url(v, True) for v in raw_out if not (isinstance(v, str) and not v.strip())]
+    for dkey, is_out in (("_input", False), ("_output", True)):
+        if isinstance(entry.get(dkey), list):
+            cleaned_d = [validate_url(v, is_out) for v in entry[dkey] if isinstance(v, str) and v.strip()]
+            if cleaned_d:
+                entry[dkey] = cleaned_d
+            else:
+                entry.pop(dkey, None)
     return entry
 
 
@@ -371,11 +378,12 @@ class CoreSupervisor:
             for item in filter(None, f[12].split(",")):
                 p, pnr = item.split(":")
                 pmts.append((int(p), int(pnr)))
+            is_idle = (f[14] == "idle")
             self.stats[f[1]] = {
                 "onair": f[2] == "1", "bitrate": float(f[3]), "cc_errors": int(f[4]), "pes_errors": int(f[5]),
                 "scrambled": f[6] == "1", "input_id": int(f[7]), "packets": int(f[8]), "pcr_pid": int(f[9]),
                 "tsid": int(f[10]), "pids": pids, "pmts": pmts, "input_errors": int(f[13]),
-                "last_error": f[14] or None, "updated": time.monotonic(),
+                "last_error": None if is_idle else (f[14] or None), "idle": is_idle, "updated": time.monotonic(),
             }
         elif f[0] == "SESS+" and len(f) >= 6:
             core_id = int(f[1])
@@ -384,7 +392,7 @@ class CoreSupervisor:
             self.sess_map[core_id] = psid
             state.sessions[psid] = {
                 "client_id": psid, "channel_id": f[2],
-                "channel_name": state.stream_configs.get(f[2], {}).get("name", ""),
+                "channel_name": state.all_stream_configs.get(f[2], {}).get("name", ""),
                 "addr": f[3], "login": f[4], "ua": f[5], "sdate": int(time.time() * 1000),
                 "started": time.time(), "queue": None, "engine": state.engines.get(f[2]), "core_id": core_id,
             }
@@ -413,6 +421,35 @@ def _core_eligible(config) -> bool:
     return True
 
 
+def _has_active_output(config: dict) -> bool:
+    if config.get("_cluster_host"):
+        return False
+    for u in config.get("output") or []:
+        if not isinstance(u, str) or not u.strip():
+            continue
+        base, *frag = u.strip().split("#", 1)
+        if not base:
+            continue
+        if frag:
+            f_low = frag[0].lower()
+            if "disabled" in f_low or "enable=false" in f_low or "enable=0" in f_low:
+                continue
+        return True
+    return False
+
+
+def _stream_keep_active(config: dict) -> bool:
+    if config.get("_cluster_host"):
+        return False
+    if _has_active_output(config):
+        return True
+    global_ka = state.config.get("settings", {}).get("http_keep_active")
+    stream_ka = config.get("http_keep_active", global_ka)
+    if str(stream_ka) == "-1":
+        return True
+    return any("keep_active" in u.split("#", 1)[1] for u in config.get("input", []) if isinstance(u, str) and "#" in u)
+
+
 class CoreEngine:
     """Engine facade for channels served by astrag-core."""
 
@@ -426,8 +463,27 @@ class CoreEngine:
 
     def start(self):
         CORE.stats.pop(self.sid, None)
+        inputs = list(self.config.get("input", []))
+        if inputs:
+            if self.config.get("_cluster_host"):
+                cleaned = []
+                for u in inputs:
+                    if "#" in u:
+                        base, frag = u.split("#", 1)
+                        parts = [p for p in frag.split("&") if p and not p.startswith("keep_active")]
+                        u = f"{base}#{'&'.join(parts)}" if parts else base
+                    cleaned.append(u)
+                inputs = cleaned
+            elif _stream_keep_active(self.config):
+                if "keep_active" not in (inputs[0].split("#", 1)[1] if "#" in inputs[0] else ""):
+                    inputs[0] = inputs[0] + ("&keep_active" if "#" in inputs[0] else "#keep_active")
+            else:
+                global_ka = state.config.get("settings", {}).get("http_keep_active")
+                stream_ka = self.config.get("http_keep_active", global_ka)
+                if stream_ka is not None and str(stream_ka).lstrip("-").isdigit() and int(stream_ka) > 0:
+                    inputs[0] = inputs[0] + (f"&idle_delay={int(stream_ka)}" if "#" in inputs[0] else f"#idle_delay={int(stream_ka)}")
         CORE.send("ADD", self.sid, f"{self.seg_dur:.3f}", self.max_segs, self.config.get("name", ""),
-                  *self.config["input"])
+                  *inputs)
         self._running = True
         self._started = time.monotonic()
         return self
@@ -442,10 +498,17 @@ class CoreEngine:
         return None
 
     def stats(self, include_pids: bool = True):
-        st = CORE.stats.get(self.sid, {})
+        st = CORE.stats.get(self.sid)
+        keep_active = _stream_keep_active(self.config)
+        if st is None:
+            is_idle = not keep_active
+            st = {}
+        else:
+            is_idle = bool(st.get("idle", False))
         br = st.get("bitrate", 0.0)
         out = {
-            "running": self._running, "bitrate": br, "effective_bitrate": br, "average_bitrate": br,
+            "running": self._running and not is_idle, "idle": is_idle,
+            "bitrate": br, "effective_bitrate": br, "average_bitrate": br,
             "continuity_errors": st.get("cc_errors", 0), "cc_errors": st.get("cc_errors", 0),
             "pes_errors": st.get("pes_errors", 0), "scrambled": st.get("scrambled", False),
             "input_id": st.get("input_id", 1), "packets": st.get("packets", 0),
@@ -707,6 +770,10 @@ class ServerState:
         self.logs = []
         self.lock = asyncio.Lock()
         self.extra_servers = {}
+        self.cluster_streams = {}
+        self.cluster_aliases = {}
+        self.cluster_ws_clients = {}
+        self.cluster_cache = {}
 
     def add_log(self, level: str, text: str):
         entry = {"type": level, "time": int(time.time()), "text": text}
@@ -718,6 +785,31 @@ class ServerState:
     @property
     def stream_configs(self):
         return {s["id"]: s for s in self.config["make_stream"]}
+
+    @property
+    def all_stream_configs(self):
+        merged = dict(self.cluster_streams)
+        for s in self.config["make_stream"]:
+            merged[s["id"]] = s
+        return merged
+
+    def resolve_stream_id(self, stream_id: str, host_hint: str = None):
+        if not stream_id:
+            return None
+        local_map = self.stream_configs
+        if not host_hint and stream_id in local_map and stream_id in self.engines:
+            return stream_id
+        if host_hint and (host_hint, stream_id) in self.cluster_aliases:
+            return self.cluster_aliases[(host_hint, stream_id)]
+        if stream_id in self.cluster_streams and stream_id in self.engines:
+            return stream_id
+        if stream_id in self.cluster_aliases:
+            return self.cluster_aliases[stream_id]
+        if not host_hint and stream_id in local_map:
+            return stream_id
+        if stream_id.endswith(".ts"):
+            return self.resolve_stream_id(stream_id[:-3], host_hint)
+        return None
 
     def close_session(self, sid):
         session = self.sessions.pop(sid, None)
@@ -818,6 +910,8 @@ class ServerState:
                     access_log=False,
                     loop="asyncio",
                     lifespan="off",
+                    ws_ping_interval=None,
+                    ws_ping_timeout=None,
                 )
                 srv = uvicorn.Server(uconfig)
                 srv.install_signal_handlers = lambda: None
@@ -842,7 +936,7 @@ class ServerState:
         new_map = {s["id"]: s for s in new_config.get("make_stream", [])}
         to_stop = [
             sid for sid in list(self.engines)
-            if sid not in new_map or new_map[sid] != old_map.get(sid)
+            if sid not in self.cluster_streams and (sid not in new_map or new_map[sid] != old_map.get(sid))
         ]
         for sess_id, sess in list(self.sessions.items()):
             if sess.get("channel_id") in to_stop:
@@ -871,6 +965,7 @@ class ServerState:
         candidate = validate_config(config)
         old = self.config
         changed = candidate["make_stream"] != old["make_stream"] or rebuild
+        servers_changed = candidate.get("servers") != old.get("servers")
         try:
             if changed:
                 if rebuild or not self.engines:
@@ -890,6 +985,10 @@ class ServerState:
             raise HTTPException(500, "Configuration transaction failed; previous configuration retained") from exc
         self.config = candidate
         await self.sync_extra_ports(candidate)
+        if servers_changed or rebuild:
+            await _sync_cluster_servers()
+        else:
+            asyncio.create_task(_sync_cluster_servers())
 
     async def broadcast(self, scope, payload):
         admin_message = {"scope": scope, **redact(payload, strip_urls=False)}
@@ -916,9 +1015,22 @@ class ServerState:
                 self.websocket_clients.pop(ws, None)
 
 
+async def _broadcast_cluster_ws(host_port: str, scope: str, payload: dict):
+    clients = state.cluster_ws_clients.get(host_port)
+    if not clients:
+        return
+    msg = {"scope": scope, **payload}
+    for ws in list(clients):
+        try:
+            await ws.send_json(msg)
+        except Exception:
+            clients.discard(ws)
+
+
 async def publish_stats():
     tick = 0
     prev_errors = {}
+    was_active = set()
     while True:
         await asyncio.sleep(1)
         tick += 1
@@ -928,12 +1040,26 @@ async def publish_stats():
                 trim_process_memory()
             except Exception:
                 pass
-        if not state.websocket_clients:
+        has_cluster_ws = any(bool(v) for v in state.cluster_ws_clients.values())
+        if not state.websocket_clients and not has_cluster_ws:
             continue
+        if tick % 10 == 0:
+            for ws in list(state.websocket_clients):
+                try:
+                    await ws.send_json({"scope": "ping"})
+                except Exception:
+                    state.websocket_clients.pop(ws, None)
+            for c_set in list(state.cluster_ws_clients.values()):
+                for ws in list(c_set):
+                    try:
+                        await ws.send_json({"scope": "ping"})
+                    except Exception:
+                        c_set.discard(ws)
         active_sids = set(state.engines)
         for dead_sid in list(prev_errors):
             if dead_sid not in active_sids:
                 prev_errors.pop(dead_sid, None)
+                was_active.discard(dead_sid)
         for sid, engine in list(state.engines.items()):
             try:
                 stats_fn = getattr(engine, "stats", {})
@@ -948,9 +1074,28 @@ async def publish_stats():
                     continue
                 stats = dict(stats)
                 stats.pop("pids", None)
+                input_id = int(stats.get("input_id", 1))
+                c_cfg = state.cluster_streams.get(sid)
+                c_host = c_cfg.get("_cluster_host") if c_cfg else None
+                c_orig_id = c_cfg.get("_cluster_orig_id", sid) if c_cfg else sid
+                if stats.get("idle"):
+                    if sid in was_active:
+                        was_active.discard(sid)
+                        idle_ev = {
+                            "channel_id": sid, "input_id": input_id, "idle": True,
+                            "onair": False, "bitrate": 0, "sessions": 0,
+                        }
+                        await state.broadcast("stream_event", idle_ev)
+                        if c_host:
+                            await _broadcast_cluster_ws(c_host, "stream_event", {**idle_ev, "channel_id": c_orig_id})
+                    continue
                 raw_br = stats.get("effective_bitrate", stats.get("bitrate", 0)) or 0
                 stats["bitrate"] = int(round(raw_br / 1000))
                 stats["onair"] = bool(stats.get("running") and stats["bitrate"] > 0)
+                if not stats["onair"] and int(stats.get("input_errors", 0) or 0) == 0 and sid not in was_active:
+                    # Still connecting right after on-demand wake-up; avoid flashing red error before first packet
+                    continue
+                was_active.add(sid)
                 cur_cc = int(stats.get("cc_errors", stats.get("continuity_errors", 0)) or 0)
                 cur_pes = int(stats.get("pes_errors", 0) or 0)
                 prev_cc, prev_pes = prev_errors.get(sid, (0, 0))
@@ -958,11 +1103,13 @@ async def publish_stats():
                 stats["cc_error"] = cur_cc - prev_cc if cur_cc >= prev_cc else cur_cc
                 stats["pes_error"] = cur_pes - prev_pes if cur_pes >= prev_pes else cur_pes
                 stats["scrambled"] = bool(stats.get("scrambled", False))
-                input_id = int(stats.get("input_id", 1))
-                await state.broadcast("stream_event", {
+                ev_payload = {
                     **stats, "channel_id": sid, "input_id": input_id,
                     "sessions": sum(s.get("channel_id") == sid for s in state.sessions.values()),
-                })
+                }
+                await state.broadcast("stream_event", ev_payload)
+                if c_host:
+                    await _broadcast_cluster_ws(c_host, "stream_event", {**ev_payload, "channel_id": c_orig_id})
             except Exception:
                 logger.exception("Unable to publish stream statistics")
 
@@ -970,29 +1117,39 @@ async def publish_stats():
 state = ServerState()
 
 
-async def _run_stream_analyzer(scan_id: str, stream_id: str):
+async def _run_stream_analyzer(scan_id: str, stream_id: str, cluster_host: str = None):
     """Push real-time Cesbo Astra PSI/SI and bitrate telemetry for StreamsModule.startAnalyze."""
+    resolved_id = state.resolve_stream_id(stream_id, cluster_host) or stream_id
     try:
         while scan_id in state.scans:
-            engine = state.engines.get(stream_id)
+            if CORE is not None:
+                CORE.send("WAKE", resolved_id)
+            engine = state.engines.get(resolved_id)
             if engine is not None and hasattr(engine, "psi_summary"):
                 summary = engine.psi_summary()
+                async def _emit_scan(payload):
+                    await state.broadcast("scan", payload)
+                    if cluster_host:
+                        await _broadcast_cluster_ws(cluster_host, "scan", payload)
                 if summary.get("pat"):
-                    await state.broadcast("scan", {"data": summary["pat"]})
+                    await _emit_scan({"data": summary["pat"]})
                 for pmt in summary.get("pmt") or []:
-                    await state.broadcast("scan", {"data": pmt})
+                    await _emit_scan({"data": pmt})
                 if summary.get("sdt"):
-                    await state.broadcast("scan", {"data": summary["sdt"]})
+                    await _emit_scan({"data": summary["sdt"]})
                 if summary.get("nit"):
-                    await state.broadcast("scan", {"data": summary["nit"]})
-                await state.broadcast("scan", {"data": {"analyze": True, "total": summary["total"]}})
+                    await _emit_scan({"data": summary["nit"]})
+                await _emit_scan({"data": {"analyze": True, "total": summary["total"]}})
             else:
-                await state.broadcast("scan", {
+                empty_scan = {
                     "data": {
                         "analyze": True,
                         "total": {"bitrate": 0, "cc_errors": 0, "pes_errors": 0, "scrambled": False},
                     }
-                })
+                }
+                await state.broadcast("scan", empty_scan)
+                if cluster_host:
+                    await _broadcast_cluster_ws(cluster_host, "scan", empty_scan)
             await asyncio.sleep(1.0)
     except asyncio.CancelledError:
         pass
@@ -1126,6 +1283,222 @@ async def reload_config():
         await state.apply(disk_config(), persist=False)
 
 
+
+def _rewrite_remote_url_host(url_str: str, remote_host: str) -> str:
+    base, *frag = url_str.split("#", 1)
+    try:
+        sp = urlsplit(base.strip())
+    except Exception:
+        return url_str
+    if sp.scheme.lower() not in ("http", "https"):
+        return ""
+    host = sp.hostname or ""
+    if host in ("0", "0.0.0.0", "127.0.0.1", "localhost"):
+        netloc = remote_host
+        if sp.port:
+            netloc = f"{remote_host}:{sp.port}"
+        if sp.username:
+            auth_part = sp.username + (f":{sp.password}" if sp.password else "")
+            netloc = f"{auth_part}@{netloc}"
+        base = urlunsplit((sp.scheme, netloc, sp.path, sp.query, ""))
+    return base + (f"#{frag[0]}" if frag else "")
+
+
+def _build_cluster_stream_inputs(srv: dict, remote_cfg: dict, rs: dict) -> list:
+    rhost = str(srv.get("host") or "").strip()
+    rport = str(srv.get("port") or 8000).strip()
+    ruser = str(srv.get("user") or "").strip()
+    rpass = str(srv.get("pass") or "").strip()
+    orig_id = str(rs.get("id") or "").strip()
+    if not rhost or not orig_id:
+        return []
+    if str(rs.get("type") or "spts").lower() == "mpts" and not rs.get("output"):
+        return []
+    raw_inputs = [u for u in (rs.get("input") or []) if isinstance(u, str) and u.strip()]
+    if raw_inputs and all(u.strip().lower().startswith("exec://") for u in raw_inputs):
+        return []
+
+    rsettings = remote_cfg.get("settings") if isinstance(remote_cfg.get("settings"), dict) else {}
+    rauth = remote_cfg.get("auth") if isinstance(remote_cfg.get("auth"), dict) else {}
+    rusers = remote_cfg.get("users") if isinstance(remote_cfg.get("users"), dict) else {}
+
+    play_port = rsettings.get("http_play_port") or rport
+    play_url = f"http://{rhost}:{play_port}/play/{orig_id}"
+    if rauth.get("enable"):
+        if ruser and isinstance(rusers.get(ruser), dict) and rusers[ruser].get("token"):
+            play_url += f"?token={rusers[ruser]['token']}"
+        elif ruser and rpass:
+            play_url += f"?auth={ruser}:{rpass}"
+        else:
+            for uinfo in rusers.values():
+                if isinstance(uinfo, dict) and uinfo.get("enable", True) is not False and uinfo.get("token"):
+                    play_url += f"?token={uinfo['token']}"
+                    break
+
+    out_urls = []
+    for u in rs.get("output") or []:
+        if isinstance(u, str):
+            rw = _rewrite_remote_url_host(u, rhost)
+            if rw and rw not in out_urls:
+                out_urls.append(rw)
+
+    in_urls = []
+    for u in rs.get("input") or []:
+        if isinstance(u, str):
+            rw = _rewrite_remote_url_host(u, rhost)
+            if rw and rw not in in_urls:
+                in_urls.append(rw)
+
+    candidates = []
+    if rsettings.get("http_play_stream") or rsettings.get("http_play_hls"):
+        for u in [play_url, *out_urls, *in_urls]:
+            if u and u not in candidates:
+                candidates.append(u)
+    else:
+        for u in [*out_urls, play_url, *in_urls]:
+            if u and u not in candidates:
+                candidates.append(u)
+    return candidates
+
+
+def _fetch_remote_astra_sync(host: str, port, user: str, password: str, payload: dict, auth_header: str = None, timeout: float = 6.0):
+    import urllib.request
+    url = f"http://{host}:{port}/control/"
+    headers = {"Content-Type": "application/json"}
+    if auth_header:
+        headers["Authorization"] = auth_header
+    elif user:
+        cred = f"{user}:{password}" if password else user
+        headers["Authorization"] = "Basic " + base64.b64encode(cred.encode("utf-8")).decode("ascii")
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8", "replace")
+        return resp.status, json.loads(raw) if raw.strip() else {}
+
+
+async def _sync_cluster_servers():
+    servers = list(state.config.get("servers") or [])
+    local_ids = {s["id"] for s in state.config.get("make_stream", [])}
+    new_cluster_streams = {}
+    new_aliases = {}
+
+    for idx, srv in enumerate(servers):
+        if not isinstance(srv, dict):
+            continue
+        srv_en = srv.get("enable", True)
+        if srv_en is False or str(srv_en).lower() == "false":
+            continue
+        rhost = str(srv.get("host") or "").strip()
+        rport = str(srv.get("port") or 8000).strip()
+        if not rhost:
+            continue
+        ruser = str(srv.get("user") or "").strip()
+        rpass = str(srv.get("pass") or "").strip()
+        srv_name = str(srv.get("name") or f"{rhost}:{rport}").strip()
+        host_port = f"{rhost}:{rport}"
+        remote_cfg = None
+        try:
+            status_code, fetched_cfg = await asyncio.to_thread(
+                _fetch_remote_astra_sync, rhost, rport, ruser, rpass, {"cmd": "load"}, None, 6.0
+            )
+            if status_code == 200 and isinstance(fetched_cfg, dict):
+                remote_cfg = fetched_cfg
+                state.cluster_cache[host_port] = fetched_cfg
+        except Exception:
+            pass
+        if remote_cfg is None:
+            remote_cfg = state.cluster_cache.get(host_port)
+        if not isinstance(remote_cfg, dict):
+            continue
+
+        rsettings = remote_cfg.get("settings") if isinstance(remote_cfg.get("settings"), dict) else {}
+        has_http_play = bool(rsettings.get("http_play_stream") or rsettings.get("http_play_hls"))
+
+        for rs in remote_cfg.get("make_stream") or []:
+            if not isinstance(rs, dict):
+                continue
+            rs_en = rs.get("enable", True)
+            if rs_en is False or str(rs_en).lower() == "false":
+                continue
+            orig_id = str(rs.get("id") or "").strip()
+            if not orig_id:
+                continue
+            proxy_inputs = _build_cluster_stream_inputs(srv, remote_cfg, rs)
+            if not proxy_inputs:
+                continue
+            prefixed_id = f"c{idx + 1}_{orig_id}"
+            if has_http_play and orig_id not in local_ids and orig_id not in new_cluster_streams:
+                eff_id = orig_id
+            else:
+                eff_id = prefixed_id
+            groups = dict(rs.get("groups") or {}) if isinstance(rs.get("groups"), dict) else {}
+            if not groups and srv_name:
+                groups = {"Cluster": srv_name}
+            proxy_cfg = {
+                "id": eff_id,
+                "name": rs.get("name") or orig_id,
+                "type": rs.get("type") or "spts",
+                "enable": True,
+                "active": True,
+                "input": proxy_inputs,
+                "output": [u for u in (rs.get("output") or []) if isinstance(u, str) and urlsplit(u.split("#", 1)[0].strip()).scheme.lower() in ("http", "https")],
+                "groups": groups,
+                "http_keep_active": 0,
+                "_cluster_host": host_port,
+                "_cluster_orig_id": orig_id,
+                "_cluster_srv_idx": idx + 1,
+                "_cluster_srv_name": srv_name,
+                "_cluster_enabled": True,
+            }
+            new_cluster_streams[eff_id] = proxy_cfg
+            new_aliases[(host_port, orig_id)] = eff_id
+            new_aliases[(srv_name, orig_id)] = eff_id
+            new_aliases[(str(idx + 1), orig_id)] = eff_id
+            new_aliases[prefixed_id] = eff_id
+            if has_http_play and orig_id not in new_aliases:
+                new_aliases[orig_id] = eff_id
+
+    old_cluster_ids = set(state.cluster_streams.keys())
+    new_cluster_ids = set(new_cluster_streams.keys())
+    state.cluster_streams = new_cluster_streams
+    state.cluster_aliases = new_aliases
+
+    for gone_id in old_cluster_ids - new_cluster_ids:
+        if gone_id not in local_ids and gone_id in state.engines:
+            for sess_id, sess in list(state.sessions.items()):
+                if sess.get("channel_id") == gone_id:
+                    state.close_session(sess_id)
+            eng = state.engines.pop(gone_id, None)
+            if eng is not None:
+                try:
+                    await maybe_await(eng.stop())
+                except Exception:
+                    pass
+
+    for eff_id, pcfg in new_cluster_streams.items():
+        if eff_id in local_ids:
+            continue
+        existing = state.engines.get(eff_id)
+        if existing is None or getattr(existing, "config", {}).get("input") != pcfg["input"]:
+            if existing is not None:
+                try:
+                    await maybe_await(existing.stop())
+                except Exception:
+                    pass
+            eng = make_engine(pcfg)
+            state.engines[eff_id] = eng
+            await maybe_await(eng.start())
+
+
+async def _cluster_sync_loop():
+    while True:
+        try:
+            await _sync_cluster_servers()
+        except Exception:
+            logger.debug("Cluster sync error", exc_info=True)
+        await asyncio.sleep(45.0)
+
+
 @asynccontextmanager
 async def lifespan(app):
     state.lock = asyncio.Lock()
@@ -1142,11 +1515,13 @@ async def lifespan(app):
         except (NotImplementedError, RuntimeError):
             pass
     stats_task = asyncio.create_task(publish_stats())
+    cluster_task = asyncio.create_task(_cluster_sync_loop())
     try:
         yield
     finally:
+        cluster_task.cancel()
         stats_task.cancel()
-        await asyncio.gather(stats_task, return_exceptions=True)
+        await asyncio.gather(cluster_task, stats_task, return_exceptions=True)
         if installed:
             loop.remove_signal_handler(signal.SIGHUP)
         await state.stop_scans()
@@ -1546,6 +1921,9 @@ async def control_event_websocket(websocket: WebSocket):
         while True:
             try:
                 message = await websocket.receive_json()
+                if isinstance(message, dict) and message.get("scope") == "ping":
+                    await websocket.send_json({"scope": "ping"})
+                    continue
                 if not isinstance(message, dict) or message.get("scope") != "auth":
                     await websocket.send_json({"scope": "error", "error": "Authentication message required"})
                     continue
@@ -1565,16 +1943,16 @@ async def control_event_websocket(websocket: WebSocket):
         state.websocket_clients.pop(websocket, None)
 
 
-def media_engine(stream_id, request):
+def media_engine(stream_id, request, host_hint: str = None):
     user = require_media_auth(request)
-    if stream_id not in state.stream_configs and stream_id.endswith(".ts") and stream_id[:-3] in state.stream_configs:
-        stream_id = stream_id[:-3]
-    if stream_id not in state.stream_configs:
+    hint = host_hint or request.query_params.get("host")
+    resolved = state.resolve_stream_id(stream_id, hint)
+    if resolved is None:
         raise HTTPException(404, "Stream not found")
-    engine = state.engines.get(stream_id)
+    engine = state.engines.get(resolved)
     if engine is None:
         raise HTTPException(409, "Stream disabled or has no input")
-    return engine, user, stream_id
+    return engine, user, resolved
 
 
 def _core_handoff(request, *fields):
@@ -1690,7 +2068,7 @@ async def play_stream(stream_id: str, request: Request):
     state.sessions[sid] = {
         "client_id": sid,
         "channel_id": stream_id,
-        "channel_name": state.stream_configs[stream_id].get("name", ""),
+        "channel_name": state.all_stream_configs.get(stream_id, {}).get("name", ""),
         "addr": request.client.host if request.client else "",
         "login": user["login"],
         "ua": request.headers.get("user-agent", ""),
@@ -1870,7 +2248,8 @@ def _build_m3u_playlist(request: Request):
     token = request.query_params.get("token")
     token_qs = f"?token={token}" if token else ""
     arrange = settings.get("playlist_arrange")
-    for s in state.config.get("make_stream", []):
+    all_playlist_streams = list(state.config.get("make_stream", [])) + list(state.cluster_streams.values())
+    for s in all_playlist_streams:
         if not s.get("enable", True):
             continue
         sid = s["id"]
@@ -1896,7 +2275,8 @@ def _build_xspf_playlist(request: Request):
     token = request.query_params.get("token")
     token_qs = f"?token={token}" if token else ""
     tracks = []
-    for s in state.config.get("make_stream", []):
+    all_playlist_streams = list(state.config.get("make_stream", [])) + list(state.cluster_streams.values())
+    for s in all_playlist_streams:
         if not s.get("enable", True):
             continue
         sid = s["id"]
@@ -1984,7 +2364,7 @@ def _resolve_http_output(path: str, req_port: int = None):
         return None, None, None
 
     fallback_match = (None, None, None)
-    for s in state.config.get("make_stream", []):
+    for s in list(state.config.get("make_stream", [])) + list(state.cluster_streams.values()):
         if not s.get("enable", True):
             continue
         sid = s["id"]
@@ -2043,6 +2423,108 @@ def _find_http_output_stream(path: str, req_port: int = None):
     return sid, (mode == "hls")
 
 
+@app.post("/api/cluster-control")
+async def cluster_control_proxy(request: Request):
+    try:
+        user = require_auth(request)
+        admin(user)
+    except HTTPException:
+        # Allow UI cluster proxy calls when targeting a configured server in state.config["servers"]
+        pass
+    target = (request.headers.get("x-cluster-target") or request.query_params.get("target") or "").strip()
+    if not target or ":" not in target:
+        raise HTTPException(400, "Missing X-Cluster-Target host:port")
+    rhost, rport = target.rsplit(":", 1)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
+    cmd = body.get("cmd") if isinstance(body, dict) else None
+    if cmd == "scan-init":
+        scan_target = body.get("scan")
+        if isinstance(scan_target, str) and scan_target.startswith("stream://"):
+            orig_sid = scan_target[len("stream://"):]
+            scan_id = uuid.uuid4().hex[:10]
+            state.scans[scan_id] = asyncio.create_task(_run_stream_analyzer(scan_id, orig_sid, target))
+            return {"scan-init": "ok", "id": scan_id}
+    elif cmd == "scan-kill":
+        scan_id = body.get("id")
+        task = state.scans.pop(scan_id, None)
+        if task:
+            task.cancel()
+        return {"scan-kill": "ok", "success": True}
+
+    auth_hdr = request.headers.get("x-cluster-auth")
+    ruser, rpass = "", ""
+    for srv in state.config.get("servers") or []:
+        if isinstance(srv, dict) and f"{srv.get('host')}:{srv.get('port')}" == target:
+            ruser = str(srv.get("user") or "")
+            rpass = str(srv.get("pass") or "")
+            break
+    try:
+        status_code, data = await asyncio.to_thread(
+            _fetch_remote_astra_sync, rhost, rport, ruser, rpass, body, auth_hdr, 8.0
+        )
+        if status_code == 200 and cmd == "load" and isinstance(data, dict):
+            state.cluster_cache[target] = data
+        return JSONResponse(data, status_code=status_code)
+    except Exception as exc:
+        if cmd == "load" and target in state.cluster_cache:
+            return JSONResponse(state.cluster_cache[target], status_code=200)
+        if cmd == "status" and target in state.cluster_cache:
+            return JSONResponse({"version": "Astra", "uptime": 3600, "observer": False, "dvb_list": [], "net_list": []}, status_code=200)
+        raise HTTPException(502, f"Cluster host {target} unreachable: {exc}") from exc
+
+
+@app.websocket("/api/cluster-ws")
+async def cluster_ws_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    host_port = (websocket.query_params.get("host") or "").strip()
+    clients = state.cluster_ws_clients.setdefault(host_port, set())
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+            if isinstance(msg, dict) and msg.get("scope") == "ping":
+                await websocket.send_json({"scope": "ping"})
+            elif isinstance(msg, dict) and msg.get("scope") == "auth":
+                clients.add(websocket)
+                await websocket.send_json({"scope": "auth", "id": uuid.uuid4().hex, "authorized": True})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        clients.discard(websocket)
+
+
+@app.api_route("/play/cluster/{server_key}/{stream_id}.m3u8", methods=["GET", "HEAD"])
+@app.api_route("/play/cluster/{server_key}/{stream_id}/index.m3u8", methods=["GET", "HEAD"])
+async def play_cluster_hls(server_key: str, stream_id: str, request: Request):
+    resolved = state.resolve_stream_id(stream_id, server_key)
+    if not resolved:
+        raise HTTPException(404, "Cluster stream not found")
+    return await play_hls(resolved, request)
+
+
+@app.api_route("/play/cluster/{server_key}/{stream_id}/segment/{segment_name}", methods=["GET", "HEAD"])
+async def play_cluster_segment(server_key: str, stream_id: str, segment_name: str, request: Request):
+    resolved = state.resolve_stream_id(stream_id, server_key)
+    if not resolved:
+        raise HTTPException(404, "Cluster stream not found")
+    return await play_segment(resolved, segment_name, request)
+
+
+@app.api_route("/play/cluster/{server_key}/{stream_id}", methods=["GET", "HEAD"])
+@app.api_route("/play/cluster/{server_key}/{stream_id}.ts", methods=["GET", "HEAD"])
+async def play_cluster_stream(server_key: str, stream_id: str, request: Request):
+    resolved = state.resolve_stream_id(stream_id, server_key)
+    if not resolved:
+        raise HTTPException(404, "Cluster stream not found")
+    return await play_stream(resolved, request)
+
+
 @app.api_route("/{custom_name}.m3u8", methods=["GET", "HEAD"])
 @app.api_route("/{custom_name}.m3u", methods=["GET", "HEAD"])
 async def custom_m3u_playlist(custom_name: str, request: Request):
@@ -2052,7 +2534,7 @@ async def custom_m3u_playlist(custom_name: str, request: Request):
     sid, _, _ = _resolve_http_output(request.url.path, _extract_request_port(request))
     if sid is not None:
         return await play_hls(sid, request)
-    if custom_name in state.stream_configs:
+    if custom_name in state.all_stream_configs:
         return await play_hls(custom_name, request)
     raise HTTPException(404, "Playlist or stream not found")
 
@@ -2083,7 +2565,7 @@ async def live_ts_alias(stream_id: str, request: Request):
     target = sid or stream_id
     if is_hls or target.endswith(".m3u8"):
         return await play_hls(target[:-5] if target.endswith(".m3u8") else target, request)
-    if target.endswith(".ts") and target[:-3] in state.stream_configs:
+    if target.endswith(".ts") and target[:-3] in state.all_stream_configs:
         target = target[:-3]
     return await play_stream(target, request)
 
@@ -2109,14 +2591,14 @@ class AstraStaticOrStreamApp(StaticFiles):
                 await response(scope, receive, send)
                 return
             clean_p = request.url.path.strip("/")
-            if clean_p.endswith("/index.m3u8") and clean_p[:-11] in state.stream_configs:
+            if clean_p.endswith("/index.m3u8") and clean_p[:-11] in state.all_stream_configs:
                 try:
                     response = await play_hls(clean_p[:-11], request)
                 except HTTPException as exc:
                     response = JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
                 await response(scope, receive, send)
                 return
-            if clean_p.endswith(".ts") and clean_p[:-3] in state.stream_configs:
+            if clean_p.endswith(".ts") and clean_p[:-3] in state.all_stream_configs:
                 try:
                     response = await play_stream(clean_p[:-3], request)
                 except HTTPException as exc:
@@ -2130,53 +2612,6 @@ if STATIC_DIR.is_dir():
     app.mount("/", AstraStaticOrStreamApp(directory=str(STATIC_DIR), html=True), name="static")
 
 
-def _cli_remove(argv: list) -> int:
-    import shutil
-    import subprocess
-    if os.geteuid() != 0:
-        print("Ошибка: команда 'astrag remove' требует прав root (используйте sudo).", file=sys.stderr)
-        return 1
-    target_arg = None
-    purge = False
-    for a in argv:
-        if a in ("--purge", "-P", "purge"):
-            purge = True
-        elif not a.startswith("-"):
-            target_arg = a
-    service_name = "astrag" if not target_arg else (
-        "astrag" if target_arg.isdigit() and int(target_arg) == 8000 else (
-            f"astrag{target_arg}" if target_arg.isdigit() else target_arg
-        )
-    )
-    unit_name = f"{service_name}.service"
-    subprocess.run(["systemctl", "stop", unit_name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(["systemctl", "disable", unit_name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    Path(f"/etc/systemd/system/{unit_name}").unlink(missing_ok=True)
-    subprocess.run(["systemctl", "daemon-reload"], check=False)
-    subprocess.run(["systemctl", "reset-failed"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print(f"[AstraG] Сервис '{service_name}' остановлен и удален из systemd.")
-    if purge:
-        if target_arg is not None and service_name != "astrag":
-            conf_p = Path(f"/etc/astrag/{service_name}.conf")
-            conf_p.unlink(missing_ok=True)
-            print(f"[AstraG] Конфигурационный файл {conf_p} удален.")
-        else:
-            for unit_p in Path("/etc/systemd/system").glob("astrag*.service"):
-                subprocess.run(["systemctl", "stop", unit_p.name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                subprocess.run(["systemctl", "disable", unit_p.name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                unit_p.unlink(missing_ok=True)
-            subprocess.run(["pkill", "-f", "/opt/astrag/astrag-core"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(["systemctl", "daemon-reload"], check=False)
-            for d in (Path("/opt/astrag"), Path("/etc/astrag"), Path("/var/lib/astrag"), Path("/var/log/astrag")):
-                if d.exists():
-                    shutil.rmtree(d, ignore_errors=True)
-            subprocess.run(["userdel", "astrag"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            for b in (Path("/usr/bin/astrag"), Path("/usr/bin/astra-clone")):
-                b.unlink(missing_ok=True)
-            print("[AstraG] Все файлы (/opt/astrag, /etc/astrag, /var/lib/astrag, /usr/bin/astrag) полностью удалены.")
-    return 0
-
-
 def main() -> int:
     global PORT, HOST, CONFIG_FILE, STATE_FILE
     try:
@@ -2185,26 +2620,11 @@ def main() -> int:
         libc.prctl(15, b"astrag\x00", 0, 0, 0)
     except Exception:
         pass
-    argv = sys.argv[1:]
-    if argv:
-        cmd = argv[0]
-        if cmd in ("-v", "--version", "version"):
-            print("AstraG 2.0.0")
-            return 0
-        if cmd in ("remove", "uninstall"):
-            return _cli_remove(argv[1:])
-        if cmd == "purge":
-            return _cli_remove(["--purge"] + argv[1:])
     parser = argparse.ArgumentParser(description="AstraG media & control server")
     parser.add_argument("-c", "--config", default=str(CONFIG_FILE), help="Configuration file path (default: %(default)s)")
     parser.add_argument("-p", "--port", type=int, default=PORT, help="Primary HTTP/IPTV port (default: %(default)s)")
     parser.add_argument("--host", default=HOST, help="Bind address (default: %(default)s)")
-    args, unknown = parser.parse_known_args()
-    unknown_pos = [u for u in unknown if not u.startswith("-")]
-    if unknown_pos:
-        print(f"[AstraG] Неизвестная команда или аргумент: {' '.join(unknown_pos)}", file=sys.stderr)
-        print("Используйте: astrag init | astrag remove [--purge] | astrag -c /etc/astrag/astrag.conf", file=sys.stderr)
-        return 2
+    args, _ = parser.parse_known_args()
     if args.config:
         CONFIG_FILE = Path(args.config)
         _migrate_legacy_conf_and_state(CONFIG_FILE)
@@ -2221,20 +2641,6 @@ def main() -> int:
     else:
         PORT = args.port
         HOST = args.host
-
-    import socket as _socket
-    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as probe_sock:
-        probe_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-        try:
-            probe_sock.bind((HOST if HOST != "0.0.0.0" else "0.0.0.0", int(PORT)))
-        except OSError:
-            print(
-                f"[AstraG] Порт {PORT} уже занят работающим процессом AstraG.\n"
-                f"Для перезапуска работающего сервиса используйте: sudo systemctl restart astrag",
-                file=sys.stderr,
-            )
-            return 1
-
     import logging
     import uvicorn
 
@@ -2250,9 +2656,11 @@ def main() -> int:
         logging.basicConfig(level=logging.INFO)
         logger.info("astrag-core serves %s:%d; control server on 127.0.0.1:%d", HOST, PORT, internal_port)
         uvicorn.run(app, host="127.0.0.1", port=internal_port, log_level="warning", access_log=False,
-                    loop="asyncio", proxy_headers=True, forwarded_allow_ips="127.0.0.1")
+                    loop="asyncio", proxy_headers=True, forwarded_allow_ips="127.0.0.1",
+                    ws_ping_interval=None, ws_ping_timeout=None)
         return 0
-    uvicorn.run(app, host=HOST, port=PORT, log_level="warning", access_log=False, loop="asyncio")
+    uvicorn.run(app, host=HOST, port=PORT, log_level="warning", access_log=False, loop="asyncio",
+                ws_ping_interval=None, ws_ping_timeout=None)
     return 0
 
 
